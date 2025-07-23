@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Flight‑Intel Uploader</title>
+  <style>
+    body { font-family:sans-serif; max-width:800px; margin:auto; padding:2rem; }
+    table { border-collapse:collapse; width:100%; margin-top:1rem }
+    th,td { border:1px solid #ddd; padding:4px; text-align:left; font-size:0.9rem }
+    #summary { margin-top:1.5rem; background:#f9f9f9; padding:1rem; border-radius:4px; }
+  </style>
+</head>
+<body>
+  <h1>Upload roster image</h1>
+  <input type="file" id="file" accept="image/*" />
+  <button id="go">Extract</button>
+
+  <pre id="raw"></pre>
+
+  <div id="summary"></div>
+  <div id="tbl"></div>
+
+<script>
+  const $ = id => document.getElementById(id);
+
+  $("go").onclick = async () => {
+    const file = $("file").files[0];
+    if(!file) return alert("Choose an image first");
+    const fd = new FormData();
+    fd.append("file", file);
+
+    $("raw").textContent = "Processing…";
+    $("summary").textContent = "";
+    $("tbl").innerHTML = "";
+
+    try {
+      const res = await fetch("http://localhost:8000/extract", { method:"POST", body:fd });
+      const data = await res.json();
+
+      $("raw").textContent = JSON.stringify(data, null, 2);
+
+      // show validation summary
+      if(data.schedule_metadata?.validation) {
+        const v = data.schedule_metadata.validation;
+        $("summary").innerHTML = `
+          <strong>Validation Summary</strong><br>
+          Valid flights: ${v.valid_flights} / ${data.flights.length}<br>
+          Avg confidence: ${(v.average_confidence*100).toFixed(1)}%<br>
+          Sources: ${v.sources_used.join(", ")}
+        `;
+      }
+
+      // show enriched flights table
+      if(data.flights?.length) {
+        const rows = data.flights.map(f => `
+          <tr>
+            <td>${f.date}</td>
+            <td>${f.flight_no}</td>
+            <td>${f.origin||""}</td>
+            <td>${f.dest||""}</td>
+            <td>${f.sched_out_local||""}</td>
+            <td>${f.sched_in_local||""}</td>
+            <td>${f.equipment||""}</td>
+            <td>${f.actual_out||""}</td>
+            <td>${f.actual_in||""}</td>
+          </tr>`).join("");
+        $("tbl").innerHTML = `
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th><th>Flight</th><th>Origin</th><th>Dest</th>
+                <th>Sched Out</th><th>Sched In</th>
+                <th>Equip</th><th>Act Out</th><th>Act In</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+      }
+    } catch(err) {
+      $("raw").textContent = "Error: " + err;
+    }
+  };
+</script>
+</body>
+</html>
