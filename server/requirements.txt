@@ -18,12 +18,17 @@ langchain==0.1.14
 langchain-core>=0.1.37,<0.2.0
 langchain-openai==0.0.4
 
-# OCR pipeline
-opencv-python==4.8.1.78
+# OCR pipeline (Tesseract only)
+opencv-python-headless==4.8.1.78
 Pillow==10.1.0
 pytesseract==0.3.10
-easyocr==1.7.0
+
+# PDF processing
+pdf2image==1.17.0
+PyPDF2==3.0.1
+
+# Optional helper
 python-Levenshtein==0.23.0
 
-# Ensures clean builds (esp. on macOS + Python 3.12)
+# Ensures clean builds
 setuptools>=68.0.0

@@ -1,85 +1,167 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>Flight‑Intel Uploader</title>
-  <style>
-    body { font-family:sans-serif; max-width:800px; margin:auto; padding:2rem; }
-    table { border-collapse:collapse; width:100%; margin-top:1rem }
-    th,td { border:1px solid #ddd; padding:4px; text-align:left; font-size:0.9rem }
-    #summary { margin-top:1.5rem; background:#f9f9f9; padding:1rem; border-radius:4px; }
-  </style>
+<meta charset="utf-8" />
+<title>Flight‑Intel Uploader</title>
+<style>
+  body { font-family: sans-serif; max-width: 900px; margin: auto; padding: 2rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+  th, td { border: 1px solid #ddd; padding: 4px; text-align: left; font-size: .9rem; }
+  #summary { margin-top: 1.5rem; background: #f9f9f9; padding: 1rem; border-radius: 4px; }
+  select, input[type=file], button { margin-top: .8rem; }
+</style>
 </head>
 <body>
   <h1>Upload roster image</h1>
-  <input type="file" id="file" accept="image/*" />
+
+  <!-- 🔽 Airline selector built from the big dict -->
+  <label>
+    Airline&nbsp;
+    <select id="airline">
+      <option value="">– pick –</option>
+    </select>
+  </label><br>
+
+<input type="file" id="file" accept="image/*,application/pdf,.pdf" />
   <button id="go">Extract</button>
 
   <pre id="raw"></pre>
-
   <div id="summary"></div>
   <div id="tbl"></div>
 
 <script>
-  const $ = id => document.getElementById(id);
+/* ---------- 1. The master list (mirrors airlines.py) ---------- */
+const AIRLINE_CODES = {
+  "AA": {icao:"AAL", name:"American Airlines"},
+  "UA": {icao:"UAL", name:"United Airlines"},
+  "DL": {icao:"DAL", name:"Delta Air Lines"},
+  "WN": {icao:"SWA", name:"Southwest Airlines"},
+  "B6": {icao:"JBU", name:"JetBlue Airways"},
+  "AS": {icao:"ASA", name:"Alaska Airlines"},
+  "NK": {icao:"NKS", name:"Spirit Airlines"},
+  "F9": {icao:"FFT", name:"Frontier Airlines"},
+  "G4": {icao:"AAY", name:"Allegiant Air"},
+  "SY": {icao:"SCX", name:"Sun Country Airlines"},
+  "HA": {icao:"HAL", name:"Hawaiian Airlines"},
+  "MX": {icao:"MXY", name:"Breeze Airways"},
+  "5X": {icao:"UPS", name:"UPS Airlines"},
+  "FX": {icao:"FDX", name:"FedEx Express"},
+  "5Y": {icao:"GTI", name:"Atlas Air"},
+  "K4": {icao:"CKS", name:"Kalitta Air"},
+  "NC": {icao:"NAC", name:"Northern Air Cargo"},
+  "GB": {icao:"ABX", name:"ABX Air"},
+  "3S": {icao:"PAC", name:"Polar Air Cargo"},
+  "M6": {icao:"AJT", name:"Amerijet International"},
+  "CV": {icao:"CLX", name:"Cargolux"},
+  "KZ": {icao:"NCA", name:"Nippon Cargo Airlines"},
+  "PO": {icao:"PAC", name:"Polar Air Cargo"},
+  "OO": {icao:"SKW", name:"SkyWest Airlines"},
+  "9E": {icao:"EDV", name:"Endeavor Air"},
+  "ZW": {icao:"AWI", name:"Air Wisconsin"},
+  "YV": {icao:"ASH", name:"Mesa Airlines"},
+  "YX": {icao:"RPA", name:"Republic Airways"},
+  "OH": {icao:"JIA", name:"PSA Airlines"},
+  "MQ": {icao:"ENY", name:"Envoy Air"},
+  "G7": {icao:"GJS", name:"GoJet Airlines"},
+  "CP": {icao:"CPZ", name:"Compass Airlines"},
+  "PT": {icao:"PDT", name:"Piedmont Airlines"},
+  "9K": {icao:"KAP", name:"Cape Air"},
+  "C5": {icao:"UCA", name:"CommutAir"},
+  "QX": {icao:"QXE", name:"Horizon Air"},
+  "AX": {icao:"LOF", name:"Trans States Airlines"},
+  "EV": {icao:"ASQ", name:"ExpressJet Airlines"},
+  "S5": {icao:"TCF", name:"Shuttle America"},
+  "N0": {icao:"NBT", name:"Norse Atlantic Airways"},
+  "MN": {icao:"CAW", name:"Comair (SA)"},
+  "XT": {icao:"CXP", name:"Xtra Airways"},
+  "SX": {icao:"SKX", name:"Skyways Express"},
+  "EG": {icao:"JAA", name:"Japan Asia Airways"},
+  "VX": {icao:"VRD", name:"Virgin America"},
+  "FL": {icao:"TRS", name:"AirTran Airways"},
+  "TZ": {icao:"AMT", name:"ATA Airlines"},
+  "J7": {icao:"VJA", name:"ValuJet"},
+  "WP": {icao:"MKU", name:"Island Air"},
+  "XO": {icao:"XOJ", name:"XOJET"},
+  "FJ": {icao:"LXJ", name:"Flexjet"},
+  "NJ": {icao:"EJA", name:"NetJets"},
+  "WU": {icao:"UPJ", name:"Wheels Up"},
+  "JJ": {icao:"JIT", name:"Jet It"},
+  "SJ": {icao:"URF", name:"Surf Air"}
+};
 
-  $("go").onclick = async () => {
-    const file = $("file").files[0];
-    if(!file) return alert("Choose an image first");
-    const fd = new FormData();
-    fd.append("file", file);
+/* ---------- 2. Populate the <select> ---------- */
+const airlineSel = document.getElementById("airline");
+Object.entries(AIRLINE_CODES)
+  .sort(([a], [b]) => a.localeCompare(b))
+  .forEach(([iata, data]) => {
+    const opt = document.createElement("option");
+    opt.value = iata;              // we’ll send the IATA
+    opt.textContent = `${iata} – ${data.name}`;
+    airlineSel.appendChild(opt);
+  });
 
-    $("raw").textContent = "Processing…";
-    $("summary").textContent = "";
-    $("tbl").innerHTML = "";
+/* ---------- 3. Helper ---------- */
+const $ = id => document.getElementById(id);
 
-    try {
-      const res = await fetch("http://localhost:8000/extract", { method:"POST", body:fd });
-      const data = await res.json();
+/* ---------- 4. Upload & call API ---------- */
+$("go").onclick = async () => {
+  const file = $("file").files[0];
+  const iata = airlineSel.value;
+  if (!file)  return alert("Choose an image first");
+  if (!iata)  return alert("Pick an airline");
 
-      $("raw").textContent = JSON.stringify(data, null, 2);
+  const fd = new FormData();
+  fd.append("file", file);
 
-      // show validation summary
-      if(data.schedule_metadata?.validation) {
-        const v = data.schedule_metadata.validation;
-        $("summary").innerHTML = `
-          <strong>Validation Summary</strong><br>
-          Valid flights: ${v.valid_flights} / ${data.flights.length}<br>
-          Avg confidence: ${(v.average_confidence*100).toFixed(1)}%<br>
-          Sources: ${v.sources_used.join(", ")}
-        `;
-      }
+  $("raw").textContent = "Processing…";
+  $("summary").textContent = "";
+  $("tbl").innerHTML = "";
 
-      // show enriched flights table
-      if(data.flights?.length) {
-        const rows = data.flights.map(f => `
-          <tr>
-            <td>${f.date}</td>
-            <td>${f.flight_no}</td>
-            <td>${f.origin||""}</td>
-            <td>${f.dest||""}</td>
-            <td>${f.sched_out_local||""}</td>
-            <td>${f.sched_in_local||""}</td>
-            <td>${f.equipment||""}</td>
-            <td>${f.actual_out||""}</td>
-            <td>${f.actual_in||""}</td>
-          </tr>`).join("");
-        $("tbl").innerHTML = `
-          <table>
-            <thead>
-              <tr>
-                <th>Date</th><th>Flight</th><th>Origin</th><th>Dest</th>
-                <th>Sched Out</th><th>Sched In</th>
-                <th>Equip</th><th>Act Out</th><th>Act In</th>
-              </tr>
-            </thead>
-            <tbody>${rows}</tbody>
-          </table>`;
-      }
-    } catch(err) {
-      $("raw").textContent = "Error: " + err;
+  try {
+    const u = `http://localhost:8000/extract?airline=${encodeURIComponent(iata)}`;
+    const res  = await fetch(u, { method:"POST", body: fd });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+
+    const data = await res.json();
+    $("raw").textContent = JSON.stringify(data, null, 2);
+
+    // Validation summary (if returned)
+    const v = data?.schedule_metadata?.validation;
+    if (v) {
+      $("summary").innerHTML = `
+        <strong>Validation</strong><br>
+        Valid flights: ${v.valid_flights}/${v.total_flights}<br>
+        Avg conf: ${(v.average_confidence*100).toFixed(1)}%<br>
+        Sources: ${v.sources_used.join(", ")}
+      `;
     }
-  };
+
+    // Flight table
+    if (data?.flights?.length) {
+      const rows = data.flights.map(f => `
+        <tr>
+          <td>${f.date}</td>
+          <td>${f.flight_no}</td>
+          <td>${f.origin||""}</td>
+          <td>${f.dest||""}</td>
+          <td>${f.sched_out_local||""}</td>
+          <td>${f.sched_in_local||""}</td>
+          <td>${f.actual_out||""}</td>
+          <td>${f.actual_in||""}</td>
+        </tr>`).join("");
+      $("tbl").innerHTML = `
+        <table>
+          <thead>
+            <tr><th>Date</th><th>Flight</th><th>Origin</th><th>Dest</th>
+                <th>Sched Out</th><th>Sched In</th>
+                <th>Act Out</th><th>Act In</th></tr>
+          </thead><tbody>${rows}</tbody>
+        </table>`;
+    }
+  } catch (err) {
+    $("raw").textContent = "Error: " + err.message;
+  }
+};
 </script>
 </body>
 </html>
