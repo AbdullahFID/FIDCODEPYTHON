@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from openai import AsyncOpenAI
 import logging
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, OrderedDict
 from flight_intel_patch import (
     validate_flights_endpoint,
     validate_extraction_results
@@ -51,7 +51,9 @@ ENABLE_LAYOUT_DETECTION = os.getenv("ENABLE_LAYOUT_DETECTION", "0") == "1"  # Op
 MAX_CELLS_TO_PROCESS = 30  # Limit cell processing
 
 # Thread pool for CPU-bound operations
-thread_pool = ThreadPoolExecutor(max_workers=4)
+# Allow tuning via environment variable
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
+thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # ---------- OCR Setup (Minimal) ------------------------------
 OCR_TESS_AVAILABLE = False
@@ -948,6 +950,11 @@ class MinimalOCR:
 # ---------- Fast O4-Mini Extractor ------------------------
 class FastO4MiniExtractor:
     """Optimized O4-Mini extraction"""
+
+    CACHE_SIZE = 64
+
+    def __init__(self):
+        self._cache = OrderedDict()
     
     @staticmethod
     def create_minimal_prompt(
@@ -959,7 +966,6 @@ class FastO4MiniExtractor:
         # Use placeholder for mega prompt
         return O4_MINI_MEGA_PROMPT
     
-    @staticmethod
     async def extract_with_o4mini(
         images: List[str],
         clarity_metrics: Dict[str, float],
@@ -967,7 +973,13 @@ class FastO4MiniExtractor:
         ocr_hints: Optional[Dict[str, List[str]]] = None
     ) -> List[Flight]:
         """Optimized extraction with O4-Mini"""
-        
+        key_data = "|".join(images)
+        if key_data in self._cache:
+            # Move to end for LRU behavior
+            flights = self._cache.pop(key_data)
+            self._cache[key_data] = flights
+            return flights
+
         prompt = FastO4MiniExtractor.create_minimal_prompt(
             clarity_metrics,
             layout_info.get("type", "mixed"),
@@ -1038,6 +1050,10 @@ class FastO4MiniExtractor:
                 tool_call = response.choices[0].message.tool_calls[0]
                 raw_data = json.loads(tool_call.function.arguments)
                 flights = [Flight(**f) for f in raw_data.get("flights", [])]
+                # Cache result
+                self._cache[key_data] = flights
+                if len(self._cache) > self.CACHE_SIZE:
+                    self._cache.popitem(last=False)
                 return flights
             
         except Exception as e:
