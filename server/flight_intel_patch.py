@@ -199,8 +199,8 @@ class AeroAPIClient:
         self._own_session = True
 
     async def __aenter__(self) -> "AeroAPIClient":
-        if not self._session:
-            self._session = aiohttp.ClientSession(headers=self._headers)
+        connector = aiohttp.TCPConnector(limit_per_host=5)
+        self._session = aiohttp.ClientSession(headers=self._headers, connector=connector)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -382,8 +382,8 @@ class FR24Client:
         self._own_session = True
 
     async def __aenter__(self) -> "FR24Client":
-        if not self._session:
-            self._session = aiohttp.ClientSession(headers=self._headers)
+        connector = aiohttp.TCPConnector(limit_per_host=5)
+        self._session = aiohttp.ClientSession(headers=self._headers, connector=connector)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -508,6 +508,28 @@ class FlightValidator:
         if self._fr24_client:
             await self._fr24_client.close()
 
+        # Reusable API clients for batch validation
+        self._aero_client: Optional[AeroAPIClient] = None
+        self._fr24_client: Optional[FR24Client] = None
+
+    async def open_clients(self) -> None:
+        """Initialize API clients for reuse across many flights."""
+        if self._has_aeroapi and not self._aero_client:
+            self._aero_client = AeroAPIClient(FLIGHTAWARE_API_KEY)
+            await self._aero_client.__aenter__()
+        if self._has_fr24 and not self._fr24_client:
+            self._fr24_client = FR24Client(FLIGHTRADAR24_API_KEY)
+            await self._fr24_client.__aenter__()
+
+    async def close_clients(self) -> None:
+        """Close any opened API clients."""
+        if self._aero_client:
+            await self._aero_client.__aexit__(None, None, None)
+            self._aero_client = None
+        if self._fr24_client:
+            await self._fr24_client.__aexit__(None, None, None)
+            self._fr24_client = None
+
     async def validate_flight(self, flight: Dict) -> ValidationResult:
         """Enhanced validation that actively fills missing fields."""
         flight_no = flight.get("flight_no")
@@ -556,15 +578,23 @@ class FlightValidator:
 
         api_results: Dict[str, Dict] = {}
 
-        async def aero_task():
-            if not self._has_aeroapi or not self._aero_client:
-                return None
-            return "aeroapi", await self._aero_client.search_flight(flight_no, flight_date)
+      async def aero_task():
+          if not self._has_aeroapi:
+              return None
+          if self._aero_client:
+              return "aeroapi", await self._aero_client.search_flight(flight_no, flight_date)
+          async with AeroAPIClient(FLIGHTAWARE_API_KEY) as client:
+              return "aeroapi", await client.search_flight(flight_no, flight_date)
 
-        async def fr24_task():
-            if not self._has_fr24 or not self._fr24_client:
-                return None
-            return "fr24", await self._fr24_client.search_flight(flight_no, flight_date)
+
+      async def fr24_task():
+          if not self._has_fr24:
+              return None
+          if self._fr24_client:
+              return "fr24", await self._fr24_client.search_flight(flight_no, flight_date)
+          async with FR24Client(FLIGHTRADAR24_API_KEY) as client:
+              return "fr24", await client.search_flight(flight_no, flight_date)
+
 
         # Gather all API results
         for res in await asyncio.gather(
@@ -863,8 +893,12 @@ class FlightValidator:
         """Validate a list of flight dicts concurrently."""
         start = time.time()
 
-        tasks = [self.validate_flight(f) for f in flights]
-        validations = await asyncio.gather(*tasks, return_exceptions=True)
+        await self.open_clients()
+        try:
+            tasks = [self.validate_flight(f) for f in flights]
+            validations = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            await self.close_clients()
 
         enriched_flights: List[EnrichedFlight] = []
         warnings: List[str] = []
