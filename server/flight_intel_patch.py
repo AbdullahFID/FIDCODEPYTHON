@@ -23,7 +23,7 @@ import logging
 import os
 import re
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,6 +52,11 @@ FIREHOSE_PASSWORD: str | None = os.getenv("FIREHOSE_PASSWORD")
 
 AEROAPI_BASE_URL = "https://aeroapi.flightaware.com/aeroapi"
 FR24_BASE_URL = "https://api.flightradar24.com/common/v1"
+
+# Simple in-memory cache for validation results
+_VALIDATION_CACHE: Dict[Tuple[str, str], Tuple[float, "ValidationResult"]] = {}
+_CACHE_TTL = 900  # seconds
+_CACHE_MAX = 1000
 
 # Airport timezone mapping for common US airports
 AIRPORT_TIMEZONES = {
@@ -186,24 +191,33 @@ class EnrichedFlight(BaseModel):
 # ░ API CLIENTS ░
 # ─────────────────────────────────────────────────────────────────────────────
 class AeroAPIClient:
-    """Enhanced wrapper around FlightAware AeroAPI."""
+    """Enhanced wrapper around FlightAware AeroAPI with session reuse."""
 
     def __init__(self, api_key: str) -> None:
         self._headers = {"x-apikey": api_key, "Accept": "application/json"}
         self._session: Optional[aiohttp.ClientSession] = None
+        self._own_session = True
 
     async def __aenter__(self) -> "AeroAPIClient":
-        self._session = aiohttp.ClientSession(headers=self._headers)
+        if not self._session:
+            self._session = aiohttp.ClientSession(headers=self._headers)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._session:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._session and self._own_session:
             await self._session.close()
+            self._session = None
 
     async def search_flight(self, flight_no: str, date: str) -> Optional[Dict]:
         """Search for flight data from AeroAPI with proper endpoint selection."""
         if not flight_no:
             return None
+
+        if self._session is None:
+            self._session = aiohttp.ClientSession(headers=self._headers)
 
         ident = flight_no.strip().upper()
         if not re.match(r"^[A-Z0-9]{2,4}\d{1,5}[A-Z]?$", ident):
@@ -356,7 +370,7 @@ class AeroAPIClient:
 
 
 class FR24Client:
-    """Enhanced wrapper for FlightRadar24 API."""
+    """Enhanced wrapper for FlightRadar24 API with session reuse."""
 
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
@@ -365,19 +379,28 @@ class FR24Client:
             "User-Agent": "Mozilla/5.0 (Flight‑Intel)",
         }
         self._session: Optional[aiohttp.ClientSession] = None
+        self._own_session = True
 
     async def __aenter__(self) -> "FR24Client":
-        self._session = aiohttp.ClientSession(headers=self._headers)
+        if not self._session:
+            self._session = aiohttp.ClientSession(headers=self._headers)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._session:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._session and self._own_session:
             await self._session.close()
+            self._session = None
 
     async def search_flight(self, flight_no: str, date: str) -> Optional[Dict]:
         """Search for flight in FR24 with enhanced date matching."""
         if not flight_no:
             return None
+
+        if self._session is None:
+            self._session = aiohttp.ClientSession(headers=self._headers)
 
         ident = flight_no.strip().upper()
         
@@ -447,6 +470,43 @@ class FlightValidator:
             logger.warning("FR24 key not configured – skipping that source")
         if not (FIREHOSE_USERNAME and FIREHOSE_PASSWORD):
             logger.warning("Firehose credentials not configured – Firehose enrichment disabled")
+        self._aero_client = AeroAPIClient(FLIGHTAWARE_API_KEY) if self._has_aeroapi else None
+        self._fr24_client = FR24Client(FLIGHTRADAR24_API_KEY) if self._has_fr24 else None
+
+    # Cache helpers -------------------------------------------------
+    def _cache_key(self, flight_no: str, date: str) -> Tuple[str, str]:
+        return flight_no.upper(), date
+
+    def _get_cached(self, flight_no: str, date: str) -> Optional[ValidationResult]:
+        key = self._cache_key(flight_no, date)
+        entry = _VALIDATION_CACHE.get(key)
+        if entry and time.time() - entry[0] < _CACHE_TTL:
+            logger.debug("Cache hit for %s on %s", flight_no, date)
+            return entry[1]
+        if entry:
+            _VALIDATION_CACHE.pop(key, None)
+        return None
+
+    def _store_cache(self, flight_no: str, date: str, result: ValidationResult) -> None:
+        key = self._cache_key(flight_no, date)
+        _VALIDATION_CACHE[key] = (time.time(), result)
+        if len(_VALIDATION_CACHE) > _CACHE_MAX:
+            # remove oldest items
+            oldest = sorted(_VALIDATION_CACHE.items(), key=lambda kv: kv[1][0])[: len(_VALIDATION_CACHE) - _CACHE_MAX]
+            for k, _ in oldest:
+                _VALIDATION_CACHE.pop(k, None)
+
+    async def __aenter__(self) -> "FlightValidator":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._aero_client:
+            await self._aero_client.close()
+        if self._fr24_client:
+            await self._fr24_client.close()
 
     async def validate_flight(self, flight: Dict) -> ValidationResult:
         """Enhanced validation that actively fills missing fields."""
@@ -464,6 +524,10 @@ class FlightValidator:
                 source="none",
                 warnings=["Missing flight_no or date"],
             )
+
+        cached = self._get_cached(flight_no, flight_date)
+        if cached:
+            return cached
 
         # Track which fields are missing and need filling
         missing_fields = []
@@ -492,18 +556,15 @@ class FlightValidator:
 
         api_results: Dict[str, Dict] = {}
 
-        # Each lookup gets its own client/session
         async def aero_task():
-            if not self._has_aeroapi:
+            if not self._has_aeroapi or not self._aero_client:
                 return None
-            async with AeroAPIClient(FLIGHTAWARE_API_KEY) as client:
-                return "aeroapi", await client.search_flight(flight_no, flight_date)
+            return "aeroapi", await self._aero_client.search_flight(flight_no, flight_date)
 
         async def fr24_task():
-            if not self._has_fr24:
+            if not self._has_fr24 or not self._fr24_client:
                 return None
-            async with FR24Client(FLIGHTRADAR24_API_KEY) as client:
-                return "fr24", await client.search_flight(flight_no, flight_date)
+            return "fr24", await self._fr24_client.search_flight(flight_no, flight_date)
 
         # Gather all API results
         for res in await asyncio.gather(
@@ -560,10 +621,11 @@ class FlightValidator:
             result = self._apply_heuristics(flight)
 
         logger.info(
-            "Validated %s via %s (%.2f) - Filled: %s", 
+            "Validated %s via %s (%.2f) - Filled: %s",
             flight_no, result.source, result.confidence,
             list(result.filled_fields.keys())
         )
+        self._store_cache(flight_no, flight_date, result)
         return result
 
     def _process_aeroapi_data(
@@ -867,9 +929,9 @@ class FlightValidator:
 # ─────────────────────────────────────────────────────────────────────────────
 async def validate_extraction_results(extraction_result: Dict) -> Dict:
     """Augment the extraction_result from GPT‑OCR pipeline with validation data."""
-    validator = FlightValidator()
     flights_to_validate = extraction_result.get("flights", [])
-    summary = await validator.validate_schedule(flights_to_validate)
+    async with FlightValidator() as validator:
+        summary = await validator.validate_schedule(flights_to_validate)
 
     extraction_result["validation"] = summary["validation_summary"]
     extraction_result["enriched_flights"] = summary["enriched_flights"]
@@ -885,5 +947,5 @@ async def validate_extraction_results(extraction_result: Dict) -> Dict:
 
 async def validate_flights_endpoint(flights: List[Dict]) -> Dict:
     """FastAPI helper – validate a list of flight dicts sent by client."""
-    validator = FlightValidator()
-    return await validator.validate_schedule(flights)
+    async with FlightValidator() as validator:
+        return await validator.validate_schedule(flights)
