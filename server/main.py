@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Any, Set
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, validator
 from openai import AsyncOpenAI
 import logging
@@ -50,8 +51,10 @@ MAX_ROIS_PER_IMAGE = 5  # Reduced from unlimited
 ENABLE_LAYOUT_DETECTION = os.getenv("ENABLE_LAYOUT_DETECTION", "0") == "1"  # Optional
 MAX_CELLS_TO_PROCESS = 30  # Limit cell processing
 
-# Thread pool for CPU-bound operations
-thread_pool = ThreadPoolExecutor(max_workers=4)
+# Thread pool for CPU-bound operations (scale with CPU cores)
+thread_pool = ThreadPoolExecutor(
+    max_workers=min(32, (os.cpu_count() or 4) * 2)
+)
 
 # ---------- OCR Setup (Minimal) ------------------------------
 OCR_TESS_AVAILABLE = False
@@ -86,6 +89,7 @@ app = FastAPI(title="Flight-Intel Vision API O4-Mini Speed", version="5.0-speed"
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # ---------- Cached Regex Patterns (Performance) ------------------------------
 class RegexCache:

@@ -193,7 +193,8 @@ class AeroAPIClient:
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self) -> "AeroAPIClient":
-        self._session = aiohttp.ClientSession(headers=self._headers)
+        connector = aiohttp.TCPConnector(limit_per_host=5)
+        self._session = aiohttp.ClientSession(headers=self._headers, connector=connector)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -367,7 +368,8 @@ class FR24Client:
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self) -> "FR24Client":
-        self._session = aiohttp.ClientSession(headers=self._headers)
+        connector = aiohttp.TCPConnector(limit_per_host=5)
+        self._session = aiohttp.ClientSession(headers=self._headers, connector=connector)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
