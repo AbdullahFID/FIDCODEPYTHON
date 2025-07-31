@@ -975,6 +975,7 @@ class FastO4MiniExtractor:
         return O4_MINI_MEGA_PROMPT
     
     async def extract_with_o4mini(
+        self,
         images: List[str],
         clarity_metrics: Dict[str, float],
         layout_info: Dict[str, Any],
@@ -1068,6 +1069,7 @@ class FastO4MiniExtractor:
             logger.error(f"O4-Mini extraction error: {e}")
             
         return []
+
 
 # ---------- Fast Relationship Detection --------------------
 class FastRelationshipExtractor:

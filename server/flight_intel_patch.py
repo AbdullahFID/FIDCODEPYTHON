@@ -578,33 +578,33 @@ class FlightValidator:
 
         api_results: Dict[str, Dict] = {}
 
-      async def aero_task():
-          if not self._has_aeroapi:
-              return None
-          if self._aero_client:
-              return "aeroapi", await self._aero_client.search_flight(flight_no, flight_date)
-          async with AeroAPIClient(FLIGHTAWARE_API_KEY) as client:
-              return "aeroapi", await client.search_flight(flight_no, flight_date)
+        async def aero_task():
+            if not self._has_aeroapi:
+                return None
+            if self._aero_client:
+                return "aeroapi", await self._aero_client.search_flight(flight_no, flight_date)
+            async with AeroAPIClient(FLIGHTAWARE_API_KEY) as client:
+                return "aeroapi", await client.search_flight(flight_no, flight_date)
 
 
-      async def fr24_task():
-          if not self._has_fr24:
-              return None
-          if self._fr24_client:
-              return "fr24", await self._fr24_client.search_flight(flight_no, flight_date)
-          async with FR24Client(FLIGHTRADAR24_API_KEY) as client:
-              return "fr24", await client.search_flight(flight_no, flight_date)
+        async def fr24_task():
+            if not self._has_fr24:
+                return None
+            if self._fr24_client:
+                return "fr24", await self._fr24_client.search_flight(flight_no, flight_date)
+            async with FR24Client(FLIGHTRADAR24_API_KEY) as client:
+                return "fr24", await client.search_flight(flight_no, flight_date)
 
 
-        # Gather all API results
-        for res in await asyncio.gather(
-            aero_task(), fr24_task(), return_exceptions=True
-        ):
-            if res and not isinstance(res, Exception) and res[1]:
-                api_results[res[0]] = res[1]
+            # Gather all API results
+            for res in await asyncio.gather(
+                aero_task(), fr24_task(), return_exceptions=True
+            ):
+                if res and not isinstance(res, Exception) and res[1]:
+                    api_results[res[0]] = res[1]
 
-        # Begin assembling ValidationResult
-        result = ValidationResult(is_valid=False, confidence=0.0, source="none")
+            # Begin assembling ValidationResult
+            result = ValidationResult(is_valid=False, confidence=0.0, source="none")
 
         # Process each API result
         if "aeroapi" in api_results:
