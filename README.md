@@ -15,6 +15,7 @@ Simple demo for the Flight‑Intel extractor. To use:
 
 3. Open `client/index.html` in your browser and upload a roster image or PDF.
 
+<<<<<<< HEAD
 ┌─────────────────────────────────────────────────────────────────────┐
 │                       API REQUEST RECEIVED                           │
 │                    (Image with Flight Data)                          │
@@ -124,3 +125,6 @@ Simple demo for the Flight‑Intel extractor. To use:
 │  • Processing statistics                                           │
 │  • Any warnings or conflicts found                                │
 └─────────────────────────────────────────────────────────────────────┘
+=======
+
+>>>>>>> 84d1bf9 (ssss)
