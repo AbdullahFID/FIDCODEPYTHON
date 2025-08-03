@@ -20,7 +20,7 @@ langchain-openai==0.0.4
 
 # OCR pipeline (Tesseract only)
 opencv-python-headless==4.8.1.78
-Pillow==10.1.0
+Pillow==11.0.0
 pytesseract==0.3.10
 
 # PDF processing
