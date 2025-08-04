@@ -1,34 +1,33 @@
 # FastAPI stack
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-multipart==0.0.6
-python-dotenv==1.0.0
-aiohttp==3.9.1
-python-dateutil==2.8.2
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
+aiohttp>=3.9.1
+python-dateutil>=2.8.2
 
-# Data handling
-numpy==1.26.4
-pydantic==2.5.0
-pydantic-core==2.14.1
-pydantic-settings==2.0.3
+# Data handling - Upgraded for Python 3.13
+numpy>=1.26.4
+pydantic>=2.7.0
+# pydantic-core will be installed as a dependency of pydantic
 
-# OpenAI + LangChain (compatible with Pydantic 2.5.0)
-openai>=1.6.1,<2.0.0
-langchain==0.1.14
-langchain-core>=0.1.37,<0.2.0
-langchain-openai==0.0.4
+# OpenAI + LangChain - Upgraded for Python 3.13
+openai>=1.16.0
+langchain>=0.1.20
+langchain-core>=0.1.52
+langchain-openai>=0.1.6
 
 # OCR pipeline (Tesseract only)
-opencv-python-headless==4.8.1.78
-Pillow==11.0.0
-pytesseract==0.3.10
+opencv-python-headless>=4.8.1.78
+Pillow>=11.0.0
+pytesseract>=0.3.10
 
 # PDF processing
-pdf2image==1.17.0
-PyPDF2==3.0.1
+pdf2image>=1.17.0
+PyPDF2>=3.0.1
 
-# Optional helper
-python-Levenshtein==0.23.0
+# Optional helper - Upgraded for Python 3.13
+python-Levenshtein>=0.25.0
 
 # Ensures clean builds
 setuptools>=68.0.0
