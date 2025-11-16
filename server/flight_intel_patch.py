@@ -1,13 +1,13 @@
 # flight_intel_patch.py
-# Flight Intel Validation & Enrichment Module – SPEED OPTIMIZED v2.2
+# Flight Intel Validation & Enrichment Module — v2.3 (resilience upgrade)
 #
-# What’s new vs your v2.0:
-# - FlightAware schedules endpoint uses correct filters (ident OR airline+flight_number), not `flight_ident`
-# - Properly passes query params for every endpoint
-# - Stronger parsing for AeroAPI responses (schedules, flights, history)
-# - Better FR24 parsing + UTC→local conversion
-# - Cleaner concurrency, caching, logging, and no accidental shadowing of stdlib modules
-# - Defensive code against missing keys and shape changes
+# Changes vs v2.2:
+# - Global async token-bucket rate limiter for AeroAPI + jittered 429 retry
+# - Small response cache to de-duplicate identical AeroAPI requests (short TTL)
+# - Tunable validator concurrency via VALIDATOR_CONCURRENCY env (default 3)
+# - Smarter schedules strategy: try airline+flight_number first; only then
+#   route-based (airline+destination[/origin]) to reduce calls and 429s
+# - Pass optional origin/dest hints from validator → AeroAPI client
 #
 # Public entrypoint:
 #   async def validate_extraction_results(extraction_result: Dict) -> Dict
@@ -30,6 +30,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Pattern
+import random
 
 try:
     from zoneinfo import ZoneInfo
@@ -61,10 +62,19 @@ FLIGHTRADAR24_API_KEY: Optional[str] = os.getenv("FLIGHTRADAR24_API_KEY")
 AEROAPI_BASE_URL = "https://aeroapi.flightaware.com/aeroapi"  # v4 path
 FR24_BASE_URL = "https://api.flightradar24.com/common/v1"     # FR24 public app API
 
+# Rate limiting / concurrency knobs
+AEROAPI_MAX_RPS = float(os.getenv("AEROAPI_MAX_RPS", "10"))   # steady tokens per second
+AEROAPI_BURST = int(os.getenv("AEROAPI_BURST", "3"))         # bucket capacity
+VALIDATOR_CONCURRENCY = int(os.getenv("VALIDATOR_CONCURRENCY", "1"))
+
 # Cache: (flight_no_upper, date_mmddyyyy) -> (ts, ValidationResult)
 _VALIDATION_CACHE: Dict[Tuple[str, str], Tuple[float, "ValidationResult"]] = {}
 _CACHE_TTL_S = 15 * 60
 _CACHE_MAX = 1000
+
+# Lightweight response cache for identical AeroAPI GETs
+_AERO_RESP_CACHE: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], Tuple[float, Any]] = {}
+_AERO_CACHE_TTL = 30.0  # seconds
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REGEX & SMALL HELPERS
@@ -198,6 +208,32 @@ class EnrichedFlight(BaseModel):
         use_enum_values = True
 
 # ─────────────────────────────────────────────────────────────────────────────
+# RATE LIMITER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _AsyncTokenBucket:
+    """Simple async token bucket limiter."""
+    def __init__(self, rate: float, burst: int):
+        self.rate = float(rate)
+        self.capacity = float(burst)
+        self.tokens = float(burst)
+        self.t = asyncio.get_event_loop().time()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, n: float = 1.0):
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            # Refill
+            self.tokens = min(self.capacity, self.tokens + (now - self.t) * self.rate)
+            self.t = now
+            if self.tokens < n:
+                wait = (n - self.tokens) / self.rate
+                await asyncio.sleep(wait)
+                self.tokens = 0.0
+            else:
+                self.tokens -= n
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AEROAPI CLIENT (FlightAware)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -208,13 +244,13 @@ class AeroAPIClient:
     Endpoints used:
       - GET /flights/{ident}?start={iso}&end={iso}
       - GET /history/flights/{ident}?start={iso}&end={iso}
-      - GET /schedules/{date_start}/{date_end}?ident={DL9013}
-        or /schedules/{date_start}/{date_end}?airline={DL}&flight_number={9013}
+      - GET /schedules/{date_start}/{date_end}?airline={DL}&flight_number={9013}
+      - GET /schedules/{date_start}/{date_end}?airline={DL}&destination={MCO}[&origin=MSP]
 
     Notes:
       • For flights beyond the 2-day live window, /schedules is preferred.
-      • We attempt 'ident' filter first; if the API rejects it, we retry airline+flight_number.
-      • We always pass query params through aiohttp (no "shadow" locals).
+      • We try flight_number first; only if empty do we try route filters.
+      • All requests pass query params via aiohttp and are rate-limited.
     """
 
     def __init__(self, api_key: str) -> None:
@@ -227,6 +263,7 @@ class AeroAPIClient:
             enable_cleanup_closed=True,
             keepalive_timeout=30,
         )
+        self._limiter = _AsyncTokenBucket(AEROAPI_MAX_RPS, AEROAPI_BURST)
 
     async def __aenter__(self) -> "AeroAPIClient":
         timeout = aiohttp.ClientTimeout(total=12, connect=3)
@@ -239,7 +276,14 @@ class AeroAPIClient:
         if self._session:
             await self._session.close()
 
-    async def search(self, flight_no: str, date_mmddyyyy: str) -> Optional[Dict[str, Any]]:
+    async def search(
+        self,
+        flight_no: str,
+        date_mmddyyyy: str,
+        *,
+        origin_hint: Optional[str] = None,
+        dest_hint: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Returns a single best-match flight dict or None.
         """
@@ -262,132 +306,193 @@ class AeroAPIClient:
         day_start_iso, day_end_iso = _iso_day_window_utc(flight_dt.year, flight_dt.month, flight_dt.day)
         days_delta = (flight_dt.date() - datetime.utcnow().date()).days
 
-        async def _do_get(path: str, params: Dict[str, Any]) -> Tuple[int, Any, float]:
-            url = f"{AEROAPI_BASE_URL}{path}"
-            t0 = time.perf_counter()
-            async with self._session.get(url, params=params) as r:
-                elapsed = time.perf_counter() - t0
-                status = r.status
-                try:
-                    body = await r.json()
-                except Exception:
-                    body = await r.text()
-                logger.info(f"AeroAPI GET {path} status={status} took={elapsed:.2f}s")
-                return status, body, elapsed
+        # Shared schedules params
+        S_PARAMS = {
+            "include_codeshares": "false",
+            "max_pages": "1",
+        }
 
-        # Strategy matrix:
-        # • Live / near past: /flights/{ident}?start&end
-        # • Far past: /history/flights/{ident}?start&end
-        # • Far future or schedule-only: /schedules/{start}/{end}?ident=IDENT (or airline+flight_number)
-        try_order: List[Tuple[str, Dict[str, Any]]] = []
+        async def _do_get(path: str, params: Dict[str, Any]) -> Tuple[int, Any, float]:
+            """GET with rate limit, small cache, and 429 backoff."""
+            await self._limiter.acquire()
+            url = f"{AEROAPI_BASE_URL}{path}"
+            key = (path, tuple(sorted((k, str(v)) for k, v in params.items())))
+            now = time.perf_counter()
+
+            # Response de-dupe cache
+            hit = _AERO_RESP_CACHE.get(key)
+            if hit and (now - hit[0] < _AERO_CACHE_TTL):
+                status, body = 200, hit[1]
+                logger.info(f"AeroAPI GET (cache) {path} params={params} status={status}")
+                return status, body, 0.0
+
+            t0 = now
+            attempts = 3
+            for attempt in range(attempts):
+                async with self._session.get(url, params=params) as r:
+                    elapsed = time.perf_counter() - t0
+                    status = r.status
+                    try:
+                        body = await r.json()
+                    except Exception:
+                        body = await r.text()
+                    logger.info(f"AeroAPI GET {path} params={params} status={status} took={elapsed:.2f}s")
+
+                    if status == 429 and attempt < attempts - 1:
+                        ra = r.headers.get("Retry-After")
+                        if ra:
+                            try:
+                                await asyncio.sleep(float(ra) + 0.5)  # Add extra 0.5s buffer
+                            except Exception:
+                                await asyncio.sleep(2.0)  # Increase from 0.8
+                        else:
+                            await asyncio.sleep(2.0 + random.random())  # Increase base delay
+                        continue
+
+                    if status == 200:
+                        _AERO_RESP_CACHE[key] = (time.perf_counter(), body)
+                        if path.startswith("/schedules") and isinstance(body, dict):
+                            if "scheduled" in body:
+                                logger.info(f"   Found {len(body['scheduled'])} scheduled flights")
+                                if body['scheduled']:
+                                    first = body['scheduled'][0]
+                                    logger.info(f"   First flight: {first.get('ident_iata')} from {first.get('origin_iata')} to {first.get('destination_iata')}")
+                        return status, body, elapsed
+                    return status, body, elapsed
+            return status, body, elapsed
+
+        # Strategy Phase A — live/near/old vs future
+        phaseA: List[Tuple[str, Dict[str, Any]]] = []
 
         if days_delta < -10:
-            # Older than ~10 days → use history
-            try_order.append((f"/history/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
+            # Older than ~10 days → /history
+            phaseA.append((f"/history/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
         elif -10 <= days_delta <= 2:
-            # within 2 days → flights endpoint can work
-            try_order.append((f"/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
+            # within 2 days → /flights
+            phaseA.append((f"/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
         else:
-            # future (more than ~2 days) → schedules
-            # 1) Preferred: schedules with ident=DL9013 (works for many airlines)
-            # 2) Fallback: schedules with airline=DL&flight_number=9013
-            try_order.append((f"/schedules/{flight_dt.strftime('%Y-%m-%d')}/{(flight_dt + timedelta(days=1)).strftime('%Y-%m-%d')}",
-                              {"ident": ident}))
+            # Future/schedules window → airline+flight_number first
             airline, number, _suffix = _split_ident(ident)
             if number:
-                sched_params: Dict[str, Any] = {"flight_number": number}
+                params = {"flight_number": number, **S_PARAMS}
                 if airline:
-                    sched_params["airline"] = airline
-                try_order.append((f"/schedules/{flight_dt.strftime('%Y-%m-%d')}/{(flight_dt + timedelta(days=1)).strftime('%Y-%m-%d')}",
-                                  sched_params))
+                    params["airline"] = airline
+                phaseA.append((
+                    f"/schedules/{flight_dt.strftime('%Y-%m-%d')}/{(flight_dt + timedelta(days=1)).strftime('%Y-%m-%d')}",
+                    params
+                ))
 
-        # Always also consider cross-trying schedules vs flights if first bucket returns nothing/400.
-        # Append alternates to widen the net without being too spammy.
-        # (But we won’t duplicate what’s already in try_order.)
-        def _have(path_prefix: str) -> bool:
-            return any(p.startswith(path_prefix) for p, _ in try_order)
+        # Always allow cross-try of flights/history to be safe (won't match far future)
+        def _have(prefix: str, arr: List[Tuple[str, Dict[str, Any]]]) -> bool:
+            return any(p.startswith(prefix) for p, _ in arr)
 
-        if not _have("/flights/"):
-            try_order.append((f"/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
-        if not _have("/history/"):
-            try_order.append((f"/history/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
-        if not _have("/schedules/"):
-            try_order.append((f"/schedules/{flight_dt.strftime('%Y-%m-%d')}/{(flight_dt + timedelta(days=1)).strftime('%Y-%m-%d')}",
-                              {"ident": ident}))
+        if not _have("/flights/", phaseA):
+            phaseA.append((f"/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
+        if not _have("/history/", phaseA):
+            phaseA.append((f"/history/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
 
-        # Execute sequentially (AeroAPI rate-limits; keep polite)
         last_error_text: Optional[str] = None
-        for path, params in try_order:
+
+        # Helper to parse and pick an item
+        def _extract_first_item(body: Any) -> Optional[Dict[str, Any]]:
+            if not isinstance(body, dict):
+                return None
+            flights_list: List[Dict[str, Any]] = []
+            
+            # Add "scheduled" to the list of fields to check (this is what /schedules returns)
+            if "scheduled" in body and isinstance(body["scheduled"], list):
+                flights_list = body["scheduled"]
+            elif "flights" in body and isinstance(body["flights"], list):
+                flights_list = body["flights"]
+            elif "data" in body and isinstance(body["data"], list):
+                flights_list = body["data"]
+            else:
+                for key, val in body.items():
+                    if isinstance(val, list) and val and isinstance(val[0], dict):
+                        flights_list = val
+                        break
+            
+            if not flights_list:
+                return None
+
+            # Prefer exact ident match; else first
+            def _matches_ident(f: Dict[str, Any]) -> bool:
+                # Check all possible ident fields
+                for k in ("ident", "ident_iata", "ident_icao", "flight_number"):
+                    v = f.get(k)
+                    if isinstance(v, str):
+                        v_clean = v.strip().upper()
+                        # Direct match
+                        if v_clean == ident:
+                            return True
+                        # Match without airline prefix (e.g., "DAL9013" matches "DL9013")
+                        if v_clean.endswith(ident[2:]) and len(v_clean) > len(ident):
+                            return True
+                
+                # Also check by flight number alone
+                airline, number, _sfx = _split_ident(ident)
+                if number:
+                    fn = str(f.get("flight_number") or "").strip()
+                    if fn == number:
+                        return True
+                
+                return False
+
+            for item in flights_list:
+                if _matches_ident(item):
+                    return item
+            return flights_list[0]
+
+        # Phase A tries
+        for path, params in phaseA:
             status, body, _elapsed = await _do_get(path, params)
 
             if status == 400:
-                # Often indicates wrong param (e.g., 'flight_ident' used in old code)
-                # Log first 200 chars to help debugging
                 err_txt = body if isinstance(body, str) else json.dumps(body)[:200]
                 logger.error(f"AeroAPI 400 on {path} params={params} err={err_txt}")
                 last_error_text = err_txt
                 continue
-            if status == 404:
+            if status in (404, 204):
                 continue
             if status != 200:
                 last_error_text = body if isinstance(body, str) else json.dumps(body)[:200]
                 continue
 
-            # Parse structural variants
-            try:
-                if not isinstance(body, dict):
-                    continue
+            item = _extract_first_item(body)
+            if item:
+                return item
 
-                # Typical shapes:
-                # • flights endpoints: {"flights": [ ... ]}
-                # • schedules: {"scheduled": [ ... ]}  (or sometimes "flights" in older variants)
-                # • history: {"flights": [ ... ]}
+        # Phase B — only if Phase A yielded nothing: try route-based schedules
+        # Use hints if available from extractor (dest first; include origin if present)
+        sched_path = f"/schedules/{flight_dt.strftime('%Y-%m-%d')}/{(flight_dt + timedelta(days=1)).strftime('%Y-%m-%d')}"
+        airline, number, _suffix = _split_ident(ident)
+        route_tries: List[Dict[str, Any]] = []
+        if dest_hint:
+            p = {"airline": airline or "DL", "destination": dest_hint, **S_PARAMS}
+            if origin_hint:
+                p["origin"] = origin_hint
+            route_tries.append(p)
+        # If no dest hint, try origin-only (less precise but sometimes returns one)
+        if origin_hint and not dest_hint:
+            route_tries.append({"airline": airline or "DL", "origin": origin_hint, **S_PARAMS})
 
-                flights_list: List[Dict[str, Any]] = []
+        for params in route_tries:
+            status, body, _elapsed = await _do_get(sched_path, params)
 
-                if "flights" in body and isinstance(body["flights"], list):
-                    flights_list = body["flights"]
-                elif "scheduled" in body and isinstance(body["scheduled"], list):
-                    flights_list = body["scheduled"]
-                elif "data" in body and isinstance(body["data"], list):
-                    flights_list = body["data"]
-                else:
-                    # Some responses nest data differently; search for list of dicts
-                    for key, val in body.items():
-                        if isinstance(val, list) and val and isinstance(val[0], dict):
-                            flights_list = val
-                            break
-
-                if not flights_list:
-                    continue
-
-                # Best-effort pick for target date/ident
-                # For schedules we may need to match ident or airline+number ourselves
-                def _matches_ident(f: Dict[str, Any]) -> bool:
-                    # fields that may contain ident
-                    for k in ("ident", "ident_iata", "ident_icao", "flight_number"):
-                        v = f.get(k)
-                        if isinstance(v, str) and v.strip().upper() == ident:
-                            return True
-                    # some schedules split (airline, flight_number)
-                    airline, number, _sfx = _split_ident(ident)
-                    if number:
-                        if (str(f.get("flight_number") or "").strip() == number and
-                            ((f.get("airline") or f.get("operator") or f.get("operator_iata") or f.get("airline_iata") or "") or airline)):
-                            # If we have airline in either the request or item, accept
-                            return True
-                    return False
-
-                # Prefer exact ident match; else just return first for the day
-                for item in flights_list:
-                    if _matches_ident(item):
-                        return item
-
-                return flights_list[0]  # best we can do
-
-            except Exception as parse_err:
-                logger.error(f"AeroAPI parse error: {parse_err}")
+            if status == 400:
+                err_txt = body if isinstance(body, str) else json.dumps(body)[:200]
+                logger.error(f"AeroAPI 400 on {sched_path} params={params} err={err_txt}")
+                last_error_text = err_txt
                 continue
+            if status in (404, 204):
+                continue
+            if status != 200:
+                last_error_text = body if isinstance(body, str) else json.dumps(body)[:200]
+                continue
+
+            item = _extract_first_item(body)
+            if item:
+                return item
 
         if last_error_text:
             logger.error(f"AeroAPI no data; last error: {last_error_text}")
@@ -417,7 +522,7 @@ class FR24Client:
     async def __aenter__(self) -> "FR24Client":
         timeout = aiohttp.ClientTimeout(total=10, connect=3)
         self._session = aiohttp.ClientSession(
-            headers={"Accept": "application/json", "User-Agent": "Flight-Intel/2.2"},
+            headers={"Accept": "application/json", "User-Agent": "Flight-Intel/2.3"},
             connector=self._connector,
             timeout=timeout,
         )
@@ -546,19 +651,23 @@ class FastFlightValidator:
             self._cache_put(flight_no, date, res)
             return res
 
-        missing = [k for k in ("origin", "dest", "sched_out_local", "sched_in_local") if not flight.get(k)]
         filled: Dict[str, Any] = {}
         source_tags: List[str] = []
         conf = 0.0
 
-        # Execute calls (in parallel, but small fan-out)
+        # Execute calls (parallel, limited by outer semaphore)
         api_results: List[Tuple[str, Optional[Dict[str, Any]]]] = []
 
         async def _call_aero() -> None:
             if not self._aero:
                 api_results.append(("aeroapi", None))
                 return
-            data = await self._aero.search(flight_no, date)
+            data = await self._aero.search(
+                flight_no,
+                date,
+                origin_hint=_normalize_airport_fast(flight.get("origin")),
+                dest_hint=_normalize_airport_fast(flight.get("dest")),
+            )
             api_results.append(("aeroapi", data))
 
         async def _call_fr24() -> None:
@@ -606,13 +715,15 @@ class FastFlightValidator:
         Extract origin/dest + scheduled times from AeroAPI record.
         Works with both /flights and /schedules shapes.
         """
-        # Origin / Dest
+        # Origin / Dest - add the _iata variants used by /schedules
         origin = (
             _normalize_airport_fast(api_data.get("origin"))
+            or _normalize_airport_fast(api_data.get("origin_iata"))  # Add this
             or _normalize_airport_fast(api_data.get("departure_airport"))
         )
         dest = (
             _normalize_airport_fast(api_data.get("destination"))
+            or _normalize_airport_fast(api_data.get("destination_iata"))  # Add this
             or _normalize_airport_fast(api_data.get("arrival_airport"))
         )
         if not origin:
@@ -635,12 +746,11 @@ class FastFlightValidator:
         def _first_iso(*keys: str) -> Optional[str]:
             for k in keys:
                 v = api_data.get(k)
-                if isinstance(v, str) and "T" in v:
+                if isinstance(v, str) and ("T" in v or v.endswith("Z")):  # Better ISO check
                     return v
                 if isinstance(v, dict):
-                    # e.g., {"scheduled": "2025-...Z"}
                     sched = v.get("scheduled")
-                    if isinstance(sched, str) and "T" in sched:
+                    if isinstance(sched, str) and ("T" in sched or sched.endswith("Z")):
                         return sched
             return None
 
@@ -700,22 +810,23 @@ class FastFlightValidator:
 
         validations: List[ValidationResult] = []
         if need:
-            sem = asyncio.Semaphore(10)
-
-            async def _lim(vf: Dict[str, Any]) -> ValidationResult:
-                async with sem:
-                    try:
-                        return await self._validate_one(vf)
-                    except Exception as e:
-                        logger.error(f"Validation exception: {e}")
-                        return ValidationResult(is_valid=False, confidence=0.0, source="error", warnings=[str(e)])
-
-            results = await asyncio.gather(*[_lim(f) for f in need], return_exceptions=True)
-            for r in results:
-                if isinstance(r, Exception):
-                    validations.append(ValidationResult(is_valid=False, confidence=0.0, source="error", warnings=[str(r)]))
-                else:
-                    validations.append(r)
+            # Sequential processing with delay between requests
+            for i, f in enumerate(need):
+                try:
+                    # Add delay after every 3rd request to avoid rate limiting
+                    if i > 0 and i % 3 == 0:
+                        await asyncio.sleep(1.0)  # 1 second delay every 3 requests
+                        
+                    result = await self._validate_one(f)
+                    validations.append(result)
+                except Exception as e:
+                    logger.error(f"Validation exception: {e}")
+                    validations.append(ValidationResult(
+                        is_valid=False, 
+                        confidence=0.0, 
+                        source="error", 
+                        warnings=[str(e)]
+                    ))
 
         # Interleave back into original order
         all_results: List[ValidationResult] = []

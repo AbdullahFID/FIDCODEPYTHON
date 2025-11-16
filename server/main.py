@@ -184,6 +184,29 @@ VISUAL ASSOCIATION:
 
 NEVER associate airports from one date with flights from another date!
 
+AIRPORT CODES IN CALENDAR CELLS:
+- Blue bars with numbers = flight numbers
+- Airport codes (SRQ, SEA, BWI) = destinations/origins
+- If you see "03 SRQ" = there's a flight on the 3rd involving SRQ
+- P/DR, REST, LC, XX, ** = crew status codes (not flights)
+- Extract ANY day that has an airport code
+
+
+SINGLE AIRPORT INTERPRETATION:
+- Single airport next to a date = DEPARTURE CITY for that day's flight
+- Example: "12 MCO" = Flight DEPARTS FROM MCO on the 12th
+- Example: "19 MIA" = Flight DEPARTS FROM MIA on the 19th
+- For single airports: Set origin=<airport>, dest=null
+- NEVER assume single airports are destinations!
+
+TWO AIRPORT INTERPRETATION:
+- Two airports (e.g., "MCO LAS") = routing MCO→LAS
+- Set origin=first airport, dest=second airport
+
+EXTRACTION RULES:
+- "12 MCO" with flight 9013 = Extract as flight_no="9013", date="09/12/2025", origin="MCO", dest=null
+- "19 MIA TPA" with flight 8619 = Extract as flight_no="8619", date="09/19/2025", origin="MIA", dest="TPA"
+
 Return as JSON with 'flights' array."""
 
 TIER2_AGGRESSIVE_PROMPT = """URGENT: Extract ALL flight information visible in this image!
@@ -193,6 +216,13 @@ Look for ANY of these patterns:
 - Airport codes: ORD, DEN, LAX, SFO (3 letters)
 - Times: 1009, 1151, 1325, 1457 (4 digits)
 - Dates: 24/Aug, 25/Aug or 08/24, 08/25
+
+AIRPORT CODES IN CALENDAR CELLS:
+- Blue bars with numbers = flight numbers
+- Airport codes (SRQ, SEA, BWI) = destinations/origins
+- If you see "03 SRQ" = there's a flight on the 3rd involving SRQ
+- P/DR, REST, LC, XX, ** = crew status codes (not flights)
+- Extract ANY day that has an airport code
 
 Common roster patterns:
 PILOT --> [number] [date]
@@ -252,7 +282,20 @@ EXTRACTION RULES FOR ANOMALIES:
 - If date column shows "01-Apr L" → convert to 04/01/2025
 - Flight prefixes: N#### → extract ####, A#### → extract ####
 
-EXTRACT EVERYTHING! Return JSON with 'flights' array.
+SINGLE AIRPORT INTERPRETATION:
+- Single airport next to a date = DEPARTURE CITY for that day's flight
+- Example: "12 MCO" = Flight DEPARTS FROM MCO on the 12th
+- Example: "19 MIA" = Flight DEPARTS FROM MIA on the 19th
+- For single airports: Set origin=<airport>, dest=null
+- NEVER assume single airports are destinations!
+
+TWO AIRPORT INTERPRETATION:
+- Two airports (e.g., "MCO LAS") = routing MCO→LAS
+- Set origin=first airport, dest=second airport
+
+EXTRACTION RULES:
+- "12 MCO" with flight 9013 = Extract as flight_no="9013", date="09/12/2025", origin="MCO", dest=null
+- "19 MIA TPA" with flight 8619 = Extract as flight_no="8619", date="09/19/2025", origin="MIA", dest="TPA"
 
 """
 
@@ -641,9 +684,43 @@ BE HELPFUL AND SPECIFIC about what went wrong and how to fix it!
 
 YOU ARE THINKING WITH THE IMAGE, NOT JUST READING IT.
 
+AIRPORT CODES IN CALENDAR CELLS:
+- Blue bars with numbers = flight numbers
+- Airport codes (SRQ, SEA, BWI) = destinations/origins
+- If you see "03 SRQ" = there's a flight on the 3rd involving SRQ
+- P/DR, REST, LC, XX, ** = crew status codes (not flights)
+- Extract ANY day that has an airport code
+
 Missing flights = mission failure.
 Unclear images = your specialty.
 But if truly impossible, explain kindly!
+
+AIRPORT CODE INTERPRETATION RULES:
+- Single airport code next to a date = could be EITHER origin OR destination
+- Two airport codes (e.g., "MCO LAS") = routing from first to second
+- For single airports: Leave BOTH origin and dest EMPTY if unsure
+- The validation API will determine the correct direction
+- DO NOT assume all airports are destinations!
+
+EXAMPLES:
+- "12 MCO" with flight 9013 = Extract as flight_no="9013", date="09/12/2025", origin=null, dest=null
+- "19 MIA TPA" with flight 8619 = Extract as flight_no="8619", date="09/19/2025", origin="MIA", dest="TPA"
+- Never guess - let the validation API fill in the blanks
+
+SINGLE AIRPORT INTERPRETATION:
+- Single airport next to a date = DEPARTURE CITY for that day's flight
+- Example: "12 MCO" = Flight DEPARTS FROM MCO on the 12th
+- Example: "19 MIA" = Flight DEPARTS FROM MIA on the 19th
+- For single airports: Set origin=<airport>, dest=null
+- NEVER assume single airports are destinations!
+
+TWO AIRPORT INTERPRETATION:
+- Two airports (e.g., "MCO LAS") = routing MCO→LAS
+- Set origin=first airport, dest=second airport
+
+EXTRACTION RULES:
+- "12 MCO" with flight 9013 = Extract as flight_no="9013", date="09/12/2025", origin="MCO", dest=null
+- "19 MIA TPA" with flight 8619 = Extract as flight_no="8619", date="09/19/2025", origin="MIA", dest="TPA"
 GO FORTH AND EXTRACT EVERYTHING! 🎯"""
 
 # ================= Image Processor =================
@@ -1150,13 +1227,39 @@ def normalize_dates(flights: List[Dict]) -> None:
 # ================= Airline Resolver =================
 @_functools.lru_cache(maxsize=512)
 def resolve_airline(code: str) -> dict:
-    code = code.upper()
+    """
+    Permissive resolver:
+      • Known IATA in AIRLINE_CODES  -> return with 'iata'
+      • Known ICAO in AIRLINE_CODES  -> return mapped to canonical 'iata'
+      • Unknown but syntactically valid IATA/ICAO -> accept without metadata
+      • Invalid format -> 400
+    """
+    code = (code or "").strip().upper()
+
+    # Known IATA
     if code in AIRLINE_CODES:
-        return {"iata": code, **AIRLINE_CODES[code]}
+        rec = AIRLINE_CODES[code].copy()
+        rec.setdefault("iata", code)
+        return rec
+
+    # Known ICAO
     for iata, data in AIRLINE_CODES.items():
-        if data.get("icao") == code:
-            return {"iata": iata, **data}
-    raise HTTPException(404, f"Unknown airline code '{code}'")
+        if data.get("icao", "").upper() == code:
+            rec = data.copy()
+            rec.setdefault("iata", iata)
+            return rec
+
+    # Unknown but syntactically valid
+    # IATA: 2 letters/numbers; sometimes 3
+    # ICAO: 3 letters/numbers (commonly 3 letters)
+    if re.fullmatch(r"[A-Z0-9]{2,3}", code):
+        if len(code) == 2:
+            return {"iata": code, "icao": None, "name": None, "country": None}
+        else:
+            # 3-char could be IATA or ICAO; keep both possibilities open
+            return {"iata": None, "icao": code, "name": None, "country": None}
+
+    raise HTTPException(400, f"Airline code '{code}' is not a valid IATA/ICAO format")
 
 # ================= PDF Processor =================
 class PDFProcessor:
@@ -1302,7 +1405,7 @@ async def extract_flights(
 
         try:
             airline_info = resolve_airline(airline_code)
-            iata_prefix = airline_info["iata"]
+            iata_prefix = airline_info.get("iata") or ""
         except HTTPException:
             raise
         except Exception:
@@ -1347,11 +1450,12 @@ async def extract_flights(
 
         # Prefix airline to numeric flight numbers
         for flight in result.flights:
-            if flight.flight_no:
-                if flight.flight_no.isdigit():
-                    flight.flight_no = f"{iata_prefix}{flight.flight_no}"
-                elif not flight.flight_no.startswith(iata_prefix) and flight.flight_no[0].isdigit():
-                    flight.flight_no = f"{iata_prefix}{flight.flight_no}"
+            if not flight.flight_no or not iata_prefix:
+                continue
+            if flight.flight_no.isdigit():
+                flight.flight_no = f"{iata_prefix}{flight.flight_no}"
+            elif flight.flight_no[0].isdigit() and not flight.flight_no.upper().startswith(iata_prefix):
+                flight.flight_no = f"{iata_prefix}{flight.flight_no}"
 
         output = jsonable_encoder(result)
         normalize_dates(output.get("flights", []))
