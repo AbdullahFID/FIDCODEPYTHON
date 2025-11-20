@@ -574,24 +574,232 @@ class FR24Client:
         return None
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AVIATION EDGE CLIENT (Cargo-focused)
+# ─────────────────────────────────────────────────────────────────────────────
+
+AVIATION_EDGE_API_KEY: Optional[str] = os.getenv("AVIATION_EDGE_KEY")
+AVIATION_EDGE_BASE = "https://aviation-edge.com/v2/public"
+
+# Cargo carriers that should prefer Aviation Edge
+CARGO_CARRIERS = {
+    "5X", "UPS",  # UPS
+    "FX", "FDX",  # FedEx
+    "5Y", "GTI",  # Atlas Air
+    "K4", "CKS",  # Kalitta Air
+    "NC", "NAC",  # Northern Air Cargo
+    "GB", "ABX",  # ABX Air
+    "3S", "PAC",  # Polar Air Cargo
+    "M6", "AJT",  # Amerijet
+    "CV", "CLX",  # Cargolux
+    "KZ", "NCA",  # Nippon Cargo
+    "PO",         # Polar Air Cargo (alternate code)
+}
+
+class AviationEdgeClient:
+    """
+    Aviation Edge API client optimized for cargo operations.
+    
+    Endpoints used:
+      - GET /timetable?iataCode={XXX}&type=departure - Real-time schedules
+      - GET /flightsFuture?iataCode={XXX}&date={YYYY-MM-DD} - Future schedules
+      - GET /routes?departureIata={XXX}&arrivalIata={YYY} - Route validation
+      - GET /airplaneDatabase?numberRegistration={N12345} - Aircraft lookup
+    """
+
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._connector = aiohttp.TCPConnector(
+            limit=15,
+            limit_per_host=8,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+            keepalive_timeout=30,
+        )
+
+    async def __aenter__(self) -> "AviationEdgeClient":
+        timeout = aiohttp.ClientTimeout(total=15, connect=4)
+        self._session = aiohttp.ClientSession(
+            headers={"Accept": "application/json"},
+            connector=self._connector,
+            timeout=timeout,
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._session:
+            await self._session.close()
+
+    async def _get(self, endpoint: str, params: Dict[str, Any]) -> Tuple[int, Any]:
+        """Shared GET with key injection."""
+        if not self._session:
+            return 503, None
+        
+        params["key"] = self._api_key
+        url = f"{AVIATION_EDGE_BASE}/{endpoint}"
+        
+        try:
+            async with self._session.get(url, params=params) as r:
+                status = r.status
+                if status == 200:
+                    data = await r.json()
+                    logger.info(f"Aviation Edge GET /{endpoint} status={status} results={len(data) if isinstance(data, list) else 'N/A'}")
+                    return status, data
+                else:
+                    text = await r.text()
+                    logger.error(f"Aviation Edge GET /{endpoint} status={status} error={text[:200]}")
+                    return status, None
+        except asyncio.TimeoutError:
+            logger.error(f"Aviation Edge GET /{endpoint} TIMEOUT")
+            return 504, None
+        except Exception as e:
+            logger.error(f"Aviation Edge GET /{endpoint} exception: {e}")
+            return 500, None
+
+    async def search(
+        self,
+        flight_no: str,
+        date_mmddyyyy: str,
+        *,
+        origin_hint: Optional[str] = None,
+        dest_hint: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Search for cargo flight using multiple strategies.
+        
+        Priority:
+        1. /timetable (for today/tomorrow)
+        2. /flightsFuture (for dates >2 days out)
+        3. /routes (fallback for route validation)
+        """
+        ident = flight_no.strip().upper()
+        
+        # Parse date
+        try:
+            m, d, y = [int(x) for x in date_mmddyyyy.split("/")]
+            flight_date = datetime(y, m, d, tzinfo=timezone.utc)
+        except Exception:
+            logger.error(f"Aviation Edge: bad date '{date_mmddyyyy}'")
+            return None
+
+        days_delta = (flight_date.date() - datetime.utcnow().date()).days
+        iso_date = flight_date.strftime("%Y-%m-%d")
+        
+        # Extract airline + flight number
+        airline, number, _sfx = _split_ident(ident)
+        
+        # Strategy 1: Real-time timetable (for recent/today flights)
+        if -2 <= days_delta <= 2 and origin_hint:
+            params = {
+                "iataCode": origin_hint,
+                "type": "departure",
+            }
+            status, data = await self._get("timetable", params)
+            
+            if status == 200 and isinstance(data, list):
+                # Filter by flight number
+                for item in data:
+                    flight_iata = (item.get("flight") or {}).get("iataNumber", "").upper()
+                    # Match DL9013 or just 9013
+                    if flight_iata == ident or (number and flight_iata.endswith(number)):
+                        return self._normalize_timetable(item)
+
+        # Strategy 2: Future schedules (for dates >2 days out)
+        if days_delta > 2:
+            params = {
+                "type": "departure",
+                "iataCode": origin_hint or dest_hint or "JFK",  # Need at least one airport
+                "date": iso_date,
+            }
+            status, data = await self._get("flightsFuture", params)
+            
+            if status == 200 and isinstance(data, list):
+                for item in data:
+                    flight_iata = (item.get("flight") or {}).get("iataNumber", "").upper()
+                    if flight_iata == ident or (number and flight_iata.endswith(number)):
+                        return self._normalize_future_schedule(item)
+
+        # Strategy 3: Routes fallback (if we have origin + dest)
+        if origin_hint and dest_hint:
+            params = {
+                "departureIata": origin_hint,
+                "arrivalIata": dest_hint,
+            }
+            if airline:
+                params["airlineIata"] = airline
+                
+            status, data = await self._get("routes", params)
+            
+            if status == 200 and isinstance(data, list):
+                # Routes don't have dates, but validate the route exists
+                for item in data:
+                    flight_num = str(item.get("flightNumber", "")).upper()
+                    if number and flight_num == number:
+                        return self._normalize_route(item, iso_date)
+
+        return None
+
+    def _normalize_timetable(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert /timetable response to standard format."""
+        return {
+            "origin": _normalize_airport_fast((item.get("departure") or {}).get("iataCode")),
+            "destination": _normalize_airport_fast((item.get("arrival") or {}).get("iataCode")),
+            "scheduled_out": (item.get("departure") or {}).get("scheduledTime"),
+            "scheduled_in": (item.get("arrival") or {}).get("scheduledTime"),
+            "flight": item.get("flight"),
+            "airline": item.get("airline"),
+            "status": item.get("status"),
+        }
+
+    def _normalize_future_schedule(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert /flightsFuture response to standard format."""
+        dep = item.get("departure") or {}
+        arr = item.get("arrival") or {}
+        
+        return {
+            "origin": _normalize_airport_fast(dep.get("iataCode")),
+            "destination": _normalize_airport_fast(arr.get("iataCode")),
+            "scheduled_out": None,  # Future schedules don't have exact times
+            "scheduled_in": None,
+            "flight": item.get("flight"),
+            "airline": item.get("airline"),
+        }
+
+    def _normalize_route(self, item: Dict[str, Any], date_iso: str) -> Dict[str, Any]:
+        """Convert /routes response to standard format."""
+        return {
+            "origin": _normalize_airport_fast(item.get("departureIata")),
+            "destination": _normalize_airport_fast(item.get("arrivalIata")),
+            "scheduled_out": None,
+            "scheduled_in": None,
+            "flight": {"iataNumber": f"{item.get('airlineIata', '')}{item.get('flightNumber', '')}"},
+            "airline": {"iataCode": item.get("airlineIata")},
+        }
+    
+    
+# ─────────────────────────────────────────────────────────────────────────────
 # VALIDATOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FastFlightValidator:
     """
     Validates & enriches each extracted flight.
-    Fills: origin, dest, sched_out_local, sched_in_local (if missing)
+    Now with cargo-specific Aviation Edge support!
     """
 
     def __init__(self) -> None:
         self._has_aero = bool(FLIGHTAWARE_API_KEY)
         self._has_fr24 = bool(FLIGHTRADAR24_API_KEY)
+        self._has_aviedge = bool(AVIATION_EDGE_API_KEY)
+        
         self._aero: Optional[AeroAPIClient] = AeroAPIClient(FLIGHTAWARE_API_KEY) if self._has_aero else None
         self._fr24: Optional[FR24Client] = FR24Client(FLIGHTRADAR24_API_KEY) if self._has_fr24 else None
+        self._aviedge: Optional[AviationEdgeClient] = AviationEdgeClient(AVIATION_EDGE_API_KEY) if self._has_aviedge else None
 
         logger.info("🔧 Validator initialized:")
         logger.info(f"   FlightAware API: {'✅' if self._has_aero else '❌'}")
         logger.info(f"   FR24 API: {'✅' if self._has_fr24 else '❌'}")
+        logger.info(f"   Aviation Edge API: {'✅' if self._has_aviedge else '❌'}")
 
     async def __aenter__(self) -> "FastFlightValidator":
         tasks = []
@@ -599,6 +807,8 @@ class FastFlightValidator:
             tasks.append(self._aero.__aenter__())
         if self._fr24:
             tasks.append(self._fr24.__aenter__())
+        if self._aviedge:
+            tasks.append(self._aviedge.__aenter__())
         if tasks:
             await asyncio.gather(*tasks)
         return self
@@ -609,8 +819,15 @@ class FastFlightValidator:
             tasks.append(self._aero.__aexit__(None, None, None))
         if self._fr24:
             tasks.append(self._fr24.__aexit__(None, None, None))
+        if self._aviedge:
+            tasks.append(self._aviedge.__aexit__(None, None, None))
         if tasks:
             await asyncio.gather(*tasks)
+
+    def _is_cargo_flight(self, flight_no: str) -> bool:
+        """Detect if flight is cargo based on airline code."""
+        airline, _num, _sfx = _split_ident(flight_no.upper())
+        return airline in CARGO_CARRIERS if airline else False
 
     def _cache_get(self, flight_no: str, date: str) -> Optional[ValidationResult]:
         key = (flight_no.upper(), date)
@@ -640,12 +857,12 @@ class FastFlightValidator:
         if not flight_no or not date:
             return ValidationResult(is_valid=False, confidence=0.0, source="none", warnings=["missing_fields"])
 
-        # cache
+        # Cache check
         cached = self._cache_get(flight_no, date)
         if cached:
             return cached
 
-        # fast pass if already complete
+        # Fast pass if already complete
         if all(flight.get(k) for k in ("origin", "dest", "sched_out_local", "sched_in_local")):
             res = ValidationResult(is_valid=True, confidence=1.0, source="complete")
             self._cache_put(flight_no, date, res)
@@ -655,10 +872,32 @@ class FastFlightValidator:
         source_tags: List[str] = []
         conf = 0.0
 
-        # Execute calls (parallel, limited by outer semaphore)
+        # 🎯 ROUTING LOGIC: Determine priority order
+        is_cargo = self._is_cargo_flight(flight_no)
+        
+        if is_cargo:
+            logger.info(f"   🚛 Cargo flight detected - priority: Aviation Edge → FlightAware → FR24")
+        else:
+            logger.info(f"   ✈️  Passenger flight detected - priority: FlightAware → Aviation Edge → FR24")
+
+        # Prepare API calls with priority order
         api_results: List[Tuple[str, Optional[Dict[str, Any]]]] = []
 
+        async def _call_aviedge() -> None:
+            """Call Aviation Edge API."""
+            if not self._aviedge:
+                api_results.append(("aviedge", None))
+                return
+            data = await self._aviedge.search(
+                flight_no,
+                date,
+                origin_hint=_normalize_airport_fast(flight.get("origin")),
+                dest_hint=_normalize_airport_fast(flight.get("dest")),
+            )
+            api_results.append(("aviedge", data))
+
         async def _call_aero() -> None:
+            """Call FlightAware API."""
             if not self._aero:
                 api_results.append(("aeroapi", None))
                 return
@@ -671,29 +910,63 @@ class FastFlightValidator:
             api_results.append(("aeroapi", data))
 
         async def _call_fr24() -> None:
+            """Call FR24 API."""
             if not self._fr24:
                 api_results.append(("fr24", None))
                 return
             data = await self._fr24.search(flight_no, date)
             api_results.append(("fr24", data))
 
-        await asyncio.gather(_call_aero(), _call_fr24())
+        # 🔥 NEW: Call ALL available APIs in parallel
+        # We'll process them in priority order afterwards
+        await asyncio.gather(_call_aviedge(), _call_aero(), _call_fr24())
 
-        # Process results in priority order: AeroAPI first, then FR24
-        for tag, data in api_results:
+        # 🎯 Process results in priority order based on flight type
+        if is_cargo:
+            # Cargo priority: Aviation Edge > FlightAware > FR24
+            priority_order = ["aviedge", "aeroapi", "fr24"]
+        else:
+            # Passenger priority: FlightAware > Aviation Edge > FR24
+            priority_order = ["aeroapi", "aviedge", "fr24"]
+
+        # Sort api_results by priority
+        api_results_sorted = sorted(
+            api_results,
+            key=lambda x: priority_order.index(x[0]) if x[0] in priority_order else 999
+        )
+
+        # Process in priority order, stop early if we get complete data
+        for tag, data in api_results_sorted:
             if not data:
                 continue
 
-            if tag == "aeroapi":
+            # Track what we had before this API call
+            fields_before = set(filled.keys())
+
+            if tag == "aviedge":
+                self._apply_aviedge_fields(data, flight, filled)
+                if len(filled) > len(fields_before):  # New fields added
+                    source_tags.append("aviation_edge")
+                    conf = max(conf, 0.90)
+            elif tag == "aeroapi":
                 self._apply_aero_fields(data, flight, filled)
-                if filled:
+                if len(filled) > len(fields_before):  # New fields added
                     source_tags.append("aeroapi")
                     conf = max(conf, 0.95)
             elif tag == "fr24":
                 self._apply_fr24_fields(data, flight, filled)
-                if filled:
+                if len(filled) > len(fields_before):  # New fields added
                     source_tags.append("fr24")
                     conf = max(conf, 0.85)
+
+            # 🚀 EARLY EXIT: If we have all fields, stop calling more APIs
+            has_all = all(
+                filled.get(k) or flight.get(k) 
+                for k in ("origin", "dest", "sched_out_local", "sched_in_local")
+            )
+            if has_all:
+                logger.info(f"   ✅ All fields complete after {tag} - skipping remaining APIs")
+                break
 
         if not source_tags:
             # Heuristic "still valid but low confidence"
@@ -710,6 +983,31 @@ class FastFlightValidator:
         self._cache_put(flight_no, date, res)
         return res
 
+    def _apply_aviedge_fields(self, api_data: Dict[str, Any], flight: Dict[str, Any], filled: Dict[str, Any]) -> None:
+        """
+        Extract fields from Aviation Edge response.
+        Handles /timetable, /flightsFuture, and /routes responses.
+        """
+        # Origin/Dest
+        origin = _normalize_airport_fast(api_data.get("origin"))
+        dest = _normalize_airport_fast(api_data.get("destination"))
+        
+        if origin and not flight.get("origin"):
+            filled["origin"] = origin
+        if dest and not flight.get("dest"):
+            filled["dest"] = dest
+
+        # Times (if present - /timetable has them, /flightsFuture doesn't)
+        sched_out = api_data.get("scheduled_out")
+        sched_in = api_data.get("scheduled_in")
+        
+        if sched_out and not flight.get("sched_out_local"):
+            # Aviation Edge times are ISO strings
+            filled["sched_out_local"] = _to_local_hhmm_from_iso(sched_out, origin or flight.get("origin"))
+        
+        if sched_in and not flight.get("sched_in_local"):
+            filled["sched_in_local"] = _to_local_hhmm_from_iso(sched_in, dest or flight.get("dest"))
+
     def _apply_aero_fields(self, api_data: Dict[str, Any], flight: Dict[str, Any], filled: Dict[str, Any]) -> None:
         """
         Extract origin/dest + scheduled times from AeroAPI record.
@@ -718,12 +1016,12 @@ class FastFlightValidator:
         # Origin / Dest - add the _iata variants used by /schedules
         origin = (
             _normalize_airport_fast(api_data.get("origin"))
-            or _normalize_airport_fast(api_data.get("origin_iata"))  # Add this
+            or _normalize_airport_fast(api_data.get("origin_iata"))
             or _normalize_airport_fast(api_data.get("departure_airport"))
         )
         dest = (
             _normalize_airport_fast(api_data.get("destination"))
-            or _normalize_airport_fast(api_data.get("destination_iata"))  # Add this
+            or _normalize_airport_fast(api_data.get("destination_iata"))
             or _normalize_airport_fast(api_data.get("arrival_airport"))
         )
         if not origin:
@@ -867,7 +1165,6 @@ class FastFlightValidator:
                 "warnings": [],
             },
         }
-
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC ENTRYPOINT
 # ─────────────────────────────────────────────────────────────────────────────
