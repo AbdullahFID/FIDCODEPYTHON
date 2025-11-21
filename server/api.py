@@ -7,7 +7,7 @@ import base64
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -311,17 +311,27 @@ async def extract(
     request: Request,
     file: UploadFile = File(...),
     airline: Optional[str] = Query(None, description="Airline IATA code, e.g. FX, DL"),
+    x_airline: Optional[str] = Header(None, alias="X-Airline"),
 ):
     """
     Main API pipeline
     """
     overall_start = time.time()
 
+    # 🔥 Merge airline sources and validate
+    airline_code = (airline or x_airline or "").strip().upper()
+    if not airline_code:
+        raise HTTPException(
+            status_code=400,
+            detail="Airline code required via ?airline=XX or X-Airline header"
+        )
+
     log_event(
         logger,
         "file_processing_started",
         field_filename=file.filename,
         content_type=file.content_type,
+        airline=airline_code,
     )
 
     file_bytes = await file.read()
@@ -335,7 +345,7 @@ async def extract(
     page_t0 = time.time()
     log_event(logger, "page_processing_started", page_number=1)
 
-    extraction_raw = await _openai_extract_flights(file_bytes, airline)
+    extraction_raw = await _openai_extract_flights(file_bytes, airline_code)
 
     page_elapsed = time.time() - page_t0
 
@@ -396,7 +406,7 @@ async def extract(
         },
         "extraction_method": "direct",
         "metadata": {
-            "airline": {"iata": airline},
+            "airline": {"iata": airline_code},
             "file": {
                 "name": file.filename,
                 "type": file.content_type,
@@ -443,7 +453,7 @@ async def extract(
         logger,
         "http_request_pipeline_completed",
         filename=file.filename,
-        airline=airline,
+        airline=airline_code,
         flights_found=total_flights,
         duration_ms=int((time.time() - overall_start) * 1000),
     )
