@@ -72,7 +72,7 @@ class ExtractionResponse(BaseModel):
     flights: List[Flight]
     connections: List[Dict[str, Any]] = []
     total_flights_found: int
-    avg_confidence: float
+    avg_conf: float  # 🔥 Changed from avg_confidence for frontend compatibility
     processing_time: Dict[str, float]
     extraction_method: str
     metadata: Dict[str, Any]
@@ -395,11 +395,28 @@ async def extract(
         else 0.0
     )
 
+    # 🔥 Filter out flights missing required fields (frontend crashes on nulls)
+    complete_flights = [
+        f for f in flights
+        if f.get("origin") and f.get("dest") 
+        and f.get("sched_out_local") and f.get("sched_in_local")
+    ]
+    
+    incomplete_count = len(flights) - len(complete_flights)
+    if incomplete_count > 0:
+        log_event(
+            logger,
+            "flights_filtered_incomplete",
+            total=len(flights),
+            complete=len(complete_flights),
+            filtered=incomplete_count,
+        )
+
     extraction_result: Dict[str, Any] = {
-        "flights": flights,
+        "flights": complete_flights,  # 🔥 Only complete flights
         "connections": connections,
-        "total_flights_found": total_flights,
-        "avg_confidence": avg_conf,
+        "total_flights_found": len(complete_flights),  # 🔥 Count only complete
+        "avg_conf": avg_conf,  # 🔥 Changed from avg_confidence
         "processing_time": {
             "total_request": time.time() - overall_start,
             "page_1_total": page_elapsed,
@@ -417,7 +434,7 @@ async def extract(
     }
 
     # If no valid flights remain, skip validation gracefully
-    if total_flights == 0:
+    if len(complete_flights) == 0:
         log_event(
             logger,
             "validation_skipped_no_valid_flights",
@@ -427,9 +444,39 @@ async def extract(
     else:
         # Run enrichment + schedule validation
         validation_start = time.time()
-        log_event(logger, "validation_started", flights=total_flights)
+        log_event(logger, "validation_started", flights=len(complete_flights))
 
         extraction_validated = await validate_extraction_results(extraction_result)
+        
+        # 🔥 Re-filter after validation (enriched_flights might have nulls)
+        if "enriched_flights" in extraction_validated:
+            complete_enriched = [
+                f for f in extraction_validated["enriched_flights"]
+                if f.get("origin") and f.get("dest")
+                and f.get("sched_out_local") and f.get("sched_in_local")
+            ]
+            extraction_validated["enriched_flights"] = complete_enriched
+            
+            log_event(
+                logger,
+                "enriched_flights_filtered",
+                total=len(extraction_validated.get("enriched_flights", [])),
+                complete=len(complete_enriched),
+            )
+        
+        # 🔥 Ensure main flights array also has no nulls
+        if "flights" in extraction_validated:
+            complete_main = [
+                f for f in extraction_validated["flights"]
+                if f.get("origin") and f.get("dest")
+                and f.get("sched_out_local") and f.get("sched_in_local")
+            ]
+            extraction_validated["flights"] = complete_main
+            extraction_validated["total_flights_found"] = len(complete_main)
+        
+        # 🔥 Fix field name for frontend compatibility
+        if "avg_confidence" in extraction_validated:
+            extraction_validated["avg_conf"] = extraction_validated.pop("avg_confidence")
 
         log_event(
             logger,
@@ -454,7 +501,7 @@ async def extract(
         "http_request_pipeline_completed",
         filename=file.filename,
         airline=airline_code,
-        flights_found=total_flights,
+        flights_found=extraction_validated.get("total_flights_found", 0),
         duration_ms=int((time.time() - overall_start) * 1000),
     )
 
