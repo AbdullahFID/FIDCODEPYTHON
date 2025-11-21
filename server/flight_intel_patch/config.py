@@ -21,6 +21,9 @@ AEROAPI_MAX_RPS: float = float(os.getenv("AEROAPI_MAX_RPS", "10"))
 AEROAPI_BURST: int = int(os.getenv("AEROAPI_BURST", "3"))
 VALIDATOR_CONCURRENCY: int = int(os.getenv("VALIDATOR_CONCURRENCY", "1"))
 
+SERVICE_NAME = os.getenv("SERVICE_NAME", "flightintel")
+ENV = os.getenv("APP_ENV", "dev")
+
 # Minimal, high-hit map of US airports → tz
 AIRPORT_TIMEZONES = {
     # Eastern

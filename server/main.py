@@ -1,16 +1,24 @@
-# main.py
-import uvicorn
+from __future__ import annotations
 
-from api import app
-from logging_utils import logger
+import os
+import logging
+
+import uvicorn
+from api import app  # this import will run configure_logging() inside api.py
+
+# Get a module-specific logger instead of importing one from logging_utils
+logger = logging.getLogger("flightintel.main")
 
 
 if __name__ == "__main__":
-    logger.logger.info("Starting Flight-Intel v8.1 server")
+    host = os.environ.get("FLIGHTINTEL_HOST", "0.0.0.0")
+    port = int(os.environ.get("FLIGHTINTEL_PORT", "8001"))
+
+    logger.info("Launching Flight-Intel server on %s:%s", host, port)
+
     uvicorn.run(
-        "api:app",
-        host="0.0.0.0",
-        port=8001,
-        log_level="info",
-        access_log=True,
+        app,
+        host=host,
+        port=port,
+        reload=os.environ.get("FLIGHTINTEL_RELOAD", "0") == "1",
     )

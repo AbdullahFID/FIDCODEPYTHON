@@ -1,324 +1,451 @@
-# api.py
-import base64
+from __future__ import annotations
+
+import io
+import logging
 import time
-import re
-from collections import defaultdict
+import base64
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-import cv2
-import numpy as np
-from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
-from fastapi.encoders import jsonable_encoder
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel, Field
-from zoneinfo import ZoneInfo
+from fastapi.responses import JSONResponse
+from PIL import Image
+from pydantic import BaseModel
+from starlette.status import HTTP_400_BAD_REQUEST
 
-from airlines import AIRLINE_CODES
+from openai import AsyncOpenAI
+
 from flight_intel_patch.validator import validate_extraction_results
-from logging_utils import logger
-from models import Result
-from pipeline import UltimatePipeline
-from pdf_processor import PDFProcessor
-import functools as _functools
+from logging_utils import configure_logging, new_request_id, log_event
 
-# ---------------- airline resolver ----------------
+# ------------------------------------------------------------------------------
+# APP + LOGGING SETUP
+# ------------------------------------------------------------------------------
 
+configure_logging()
+logger = logging.getLogger("flightintel.api")
 
-def resolve_airline(code: str) -> dict:
-    """
-    Permissive resolver:
-      • Known IATA in AIRLINE_CODES  -> return with 'iata'
-      • Known ICAO in AIRLINE_CODES  -> return mapped to canonical 'iata'
-      • Unknown but syntactically valid IATA/ICAO -> accept without metadata
-      • Invalid format -> 400
-    """
-    from fastapi import HTTPException
+app = FastAPI(title="Flight-Intel v8.1", version="8.1.0")
 
-    code = (code or "").strip().upper()
-
-    # Known IATA
-    if code in AIRLINE_CODES:
-        rec = AIRLINE_CODES[code].copy()
-        rec.setdefault("iata", code)
-        return rec
-
-    # Known ICAO
-    for iata, data in AIRLINE_CODES.items():
-        if data.get("icao", "").upper() == code:
-            rec = data.copy()
-            rec.setdefault("iata", iata)
-            return rec
-
-    # Unknown but syntactically valid
-    if re.fullmatch(r"[A-Z0-9]{2,3}", code):
-        if len(code) == 2:
-            return {"iata": code, "icao": None, "name": None, "country": None}
-        return {"iata": None, "icao": code, "name": None, "country": None}
-
-    raise HTTPException(400, f"Airline code '{code}' is not a valid IATA/ICAO format")
-
-
-# ---------------- date normalizer ----------------
-
-
-def normalize_dates(flights: List[Dict[str, Any]]) -> None:
-    today = datetime.now(ZoneInfo("America/Toronto"))
-    current_year = today.year
-    current_month = today.month
-    month_map = {
-        "jan": 1,
-        "feb": 2,
-        "mar": 3,
-        "apr": 4,
-        "may": 5,
-        "jun": 6,
-        "jul": 7,
-        "aug": 8,
-        "sep": 9,
-        "oct": 10,
-        "nov": 11,
-        "dec": 12,
-    }
-
-    for f in flights:
-        date_str = f.get("date", "")
-        if not date_str:
-            continue
-
-        if "/" in date_str and any(mon in date_str.lower() for mon in month_map):
-            parts = date_str.split("/")
-            if len(parts) == 2:
-                day = parts[0].strip()
-                mon_str = parts[1].strip().lower()[:3]
-                if mon_str in month_map:
-                    month = month_map[mon_str]
-                    year = current_year + (1 if current_month >= 10 and month <= 2 else 0)
-                    f["date"] = f"{month:02d}/{day.zfill(2)}/{year}"
-                    continue
-
-        if "/" in date_str:
-            parts = date_str.split("/")
-            if len(parts) >= 2:
-                try:
-                    month = int(parts[0])
-                    day = int(parts[1])
-                    year = int(parts[2]) if len(parts) > 2 else current_year
-                    if year < 100:
-                        year += 2000
-                    if current_month >= 10 and month <= 2:
-                        year = current_year + 1
-                    elif year < current_year:
-                        year = current_year
-                    f["date"] = f"{month:02d}/{day:02d}/{year}"
-                except Exception:
-                    continue
-
-
-# ---------------- FastAPI app ----------------
-
-pipeline = UltimatePipeline()
-
-app = FastAPI(
-    title="Flight-Intel v8.x",
-    version="8.1.0",
-    description="Maximum accuracy flight extraction with GPT-5.1",
-)
-
+# Basic CORS (adjust origins for your environment)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True,
 )
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# OpenAI client
+client = AsyncOpenAI()
+
+MODEL_NAME = "gpt-5.1"
+OPENAI_TIMEOUT_SECONDS = 30
+WORKER_COUNT = 16
+
+logger.info(
+    "Config: model=%s, timeout=%ss, workers=%s",
+    MODEL_NAME,
+    OPENAI_TIMEOUT_SECONDS,
+    WORKER_COUNT,
+)
+logger.info("Starting Flight-Intel v8.1 server")
 
 
-@app.post("/extract", response_model=None)
-async def extract_flights(
-    file: UploadFile = File(..., description="Image or PDF file"),
-    airline: Optional[str] = Query(None, description="Airline code (IATA/ICAO)"),
-    x_airline: Optional[str] = Header(None, alias="X-Airline"),
-):
-    logger.start_timer("http_request")
-    request_start = time.perf_counter()
+# ------------------------------------------------------------------------------
+# SHARED MODELS
+# ------------------------------------------------------------------------------
 
+class Flight(BaseModel):
+    date: str
+    flight_no: str
+    origin: Optional[str] = None
+    dest: Optional[str] = None
+    sched_out_local: Optional[str] = None
+    sched_in_local: Optional[str] = None
+    page_number: Optional[int] = None
+    confidence: float = 1.0
+
+
+class ExtractionResponse(BaseModel):
+    flights: List[Flight]
+    connections: List[Dict[str, Any]] = []
+    total_flights_found: int
+    avg_confidence: float
+    processing_time: Dict[str, float]
+    extraction_method: str
+    metadata: Dict[str, Any]
+    validation: Optional[Dict[str, Any]] = None
+    enriched_flights: Optional[List[Dict[str, Any]]] = None
+    cost_analysis: Optional[Dict[str, Any]] = None
+
+
+# ------------------------------------------------------------------------------
+# REQUEST LOGGING MIDDLEWARE (Loki-ready)
+# ------------------------------------------------------------------------------
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    rid = new_request_id()
+    start = time.time()
+
+    log_event(
+        logger,
+        "http_request_started",
+        method=request.method,
+        path=request.url.path,
+        client_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        request_id=rid,
+    )
+
+    status_code = 500
     try:
-        ctype = (file.content_type or "").lower()
-        is_pdf = ctype == "application/pdf"
-        is_image = ctype.startswith("image/")
-        if not (is_pdf or is_image):
-            raise HTTPException(415, "Please upload an image (PNG/JPEG) or PDF file")
-
-        airline_code = (airline or x_airline or "").strip()
-        if not airline_code:
-            raise HTTPException(
-                400, "Please provide airline code via ?airline=XX or X-Airline header"
-            )
-
-        airline_info = resolve_airline(airline_code)
-        iata_prefix = airline_info.get("iata") or ""
-
-        logger.start_timer("file_processing")
-        file_data = await file.read()
-
-        if is_pdf:
-            logger.logger.info(
-                f"Processing PDF: {file.filename} ({len(file_data):,} bytes)"
-            )
-            images = await PDFProcessor.convert(file_data)
-        else:
-            np_img = cv2.imdecode(np.frombuffer(file_data, np.uint8), cv2.IMREAD_COLOR)
-            if np_img is None:
-                raise HTTPException(422, "Unable to decode image file")
-            images = [np_img]
-            logger.logger.info(f"Processing image: {file.filename}")
-
-        logger.end_timer("file_processing")
-
-        result: Result = await pipeline.process(images)
-
-        # propagate TIER3-style error if extraction failed
-        if pipeline.extractor.extraction_error and not result.flights:
-            err = pipeline.extractor.extraction_error
-            return {
-                "success": False,
-                "error": True,
-                "message": err.get(
-                    "user_message", "Unable to extract flight information from the image"
-                ),
-                "technical_reason": err.get("technical_reason", "Unknown extraction failure"),
-                "suggestions": err.get(
-                    "suggestions",
-                    [
-                        "Ensure the image is clear and well-lit",
-                        "Make sure the entire schedule is visible",
-                        "Try taking the photo from directly above",
-                    ],
-                ),
-                "metadata": {
-                    "airline": airline_info,
-                    "file": {
-                        "name": file.filename,
-                        "type": "pdf" if is_pdf else "image",
-                        "size": len(file_data),
-                    },
-                    "timestamp": datetime.now().isoformat(),
-                },
-            }
-
-        # prefix numeric flight numbers with airline
-        for flight in result.flights:
-            if not flight.flight_no or not iata_prefix:
-                continue
-            fn = flight.flight_no
-            if fn.isdigit():
-                flight.flight_no = f"{iata_prefix}{fn}"
-            elif fn[0].isdigit() and not fn.upper().startswith(iata_prefix):
-                flight.flight_no = f"{iata_prefix}{fn}"
-
-        output = jsonable_encoder(result)
-        normalize_dates(output.get("flights", []))
-
-        output["metadata"] = {
-            "airline": airline_info,
-            "file": {
-                "name": file.filename,
-                "type": "pdf" if is_pdf else "image",
-                "size": len(file_data),
-                "pages": len(images) if is_pdf else 1,
-            },
-            "processing": {
-                "started": datetime.fromtimestamp(request_start).isoformat(),
-                "version": "8.1.0",
-            },
-        }
-
-        # do we need validation enrichment?
-        needs_enrichment = any(
-            not all(
-                [
-                    f.get("origin"),
-                    f.get("dest"),
-                    f.get("sched_out_local"),
-                    f.get("sched_in_local"),
-                ]
-            )
-            for f in output.get("flights", [])
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        duration_ms = int((time.time() - start) * 1000)
+        log_event(
+            logger,
+            "http_request_finished",
+            method=request.method,
+            path=request.url.path,
+            status_code=status_code,
+            duration_ms=duration_ms,
+            request_id=rid,
         )
 
-        if needs_enrichment and output.get("flights"):
-            logger.logger.info("Validation needed - missing fields detected")
 
-            miss = defaultdict(int)
-            for f in output.get("flights", []):
-                if not f.get("origin"):
-                    miss["origin"] += 1
-                if not f.get("dest"):
-                    miss["dest"] += 1
-                if not f.get("sched_out_local"):
-                    miss["sched_out_local"] += 1
-                if not f.get("sched_in_local"):
-                    miss["sched_in_local"] += 1
-            logger.logger.info(f"Missing fields summary: {dict(miss)}")
+# ------------------------------------------------------------------------------
+# IMAGE QUALITY ANALYSIS
+# ------------------------------------------------------------------------------
 
-            logger.start_timer("validation")
-            try:
-                enriched = await validate_extraction_results(output)
-                output.update(enriched)
-            finally:
-                logger.end_timer("validation")
-        else:
-            logger.logger.info("All fields complete - skipping validation")
+def _analyse_image_quality(image_bytes: bytes) -> Dict[str, Any]:
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("L")
+        w, h = img.size
+        pixels = img.load()
 
-        output.setdefault("processing_time", {})
-        output["processing_time"]["total_request"] = logger.end_timer("http_request")
+        # Simple sharpness metric
+        total_diff = 0
+        count = 0
+        for y in range(1, h):
+            for x in range(1, w):
+                total_diff += abs(pixels[x, y] - pixels[x - 1, y])
+                total_diff += abs(pixels[x, y] - pixels[x, y - 1])
+                count += 2
+        sharpness = total_diff / max(count, 1)
 
-        # cost summary from extractor
-        if pipeline.extractor.total_tokens_used:
-            output["cost_analysis"] = {
-                "total_tokens": pipeline.extractor.total_tokens_used,
-                "total_cost_usd": round(pipeline.extractor.total_cost, 4),
-                "api_calls": pipeline.extractor.api_calls_count,
-                "avg_tokens_per_call": (
-                    pipeline.extractor.total_tokens_used
-                    // max(pipeline.extractor.api_calls_count, 1)
-                ),
-                "pricing_model": "gpt-5.1 ($2.50/1M input, $10/1M output)",
-            }
+        # Simple contrast proxy
+        mean = sum(pixels[x, y] for x in range(w) for y in range(h)) / float(w * h)
+        var = sum((pixels[x, y] - mean) ** 2 for x in range(w) for y in range(h)) / float(
+            w * h
+        )
+        contrast = var ** 0.5
 
-        return output
-
-    except HTTPException:
-        logger.end_timer("http_request")
-        raise
+        return {
+            "sharp": round(sharpness, 1),
+            "contrast": round(contrast, 1),
+            "grid": w > 800 and h > 800,
+            "text_regions": int((w * h) / 2000),
+        }
     except Exception as e:
-        logger.end_timer("http_request")
-        logger.logger.error(f"Request failed: {e}", exc_info=True)
-        raise HTTPException(500, f"Processing failed: {str(e)}")
+        log_event(logger, "image_quality_error", level=logging.WARNING, error=str(e))
+        return {
+            "sharp": None,
+            "contrast": None,
+            "grid": None,
+            "text_regions": None,
+        }
 
+
+# ------------------------------------------------------------------------------
+# OPENAI VISION (CORRECTED + STRONG CONSTRAINTS)
+# ------------------------------------------------------------------------------
+
+async def _openai_extract_flights(
+    image_bytes: bytes,
+    airline: Optional[str],
+) -> Dict[str, Any]:
+
+    import json
+
+    t0 = time.time()
+
+    # Base64 encode the image
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    image_url = f"data:image/jpeg;base64,{b64}"
+
+    system_prompt = (
+        "You are a flight schedule extraction engine.\n"
+        "You receive an image (or PDF page) of a bid award / roster / schedule.\n\n"
+        "Return ONLY valid JSON with this structure:\n"
+        "{\n"
+        '  \"flights\": [\n'
+        "    {\n"
+        '      \"date\": \"MM/DD/YYYY\",  // REQUIRED\n'
+        '      \"flight_no\": \"AA1234\", // REQUIRED, non-empty\n'
+        '      \"origin\": \"JFK\" or null,\n'
+        '      \"dest\": \"LAX\" or null,\n'
+        '      \"sched_out_local\": \"HHMM\" or null,\n'
+        '      \"sched_in_local\": \"HHMM\" or null,\n'
+        '      \"page_number\": 1,\n'
+        '      \"confidence\": 0.0\n'
+        "    }\n"
+        "  ],\n"
+        '  \"connections\": []\n'
+        "}\n\n"
+        "CRITICAL RULES:\n"
+        "1) If the flight number cannot be read, DO NOT include that row in `flights`.\n"
+        "2) `flight_no` must NEVER be empty or missing for any flight.\n"
+        "3) If any other field is unknown, set it to null.\n"
+    )
+
+    if airline:
+        system_prompt += (
+            f"\nThe primary airline IATA code to prioritise is '{airline}'. "
+            "If there is ambiguity, prefer flights from this airline."
+        )
+
+    log_event(logger, "openai_call_started", model=MODEL_NAME)
+
+    try:
+        resp = await client.chat.completions.create(
+            model=MODEL_NAME,
+            max_completion_tokens=2048,
+            temperature=0,
+            timeout=OPENAI_TIMEOUT_SECONDS,
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Extract all flights from this schedule. "
+                                "Return ONLY JSON as specified. "
+                                "Do NOT include flights that are missing a flight number."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_url},
+                        },
+                    ],
+                },
+            ],
+        )
+    except Exception as e:
+        log_event(logger, "openai_call_error", level=logging.ERROR, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+    elapsed = time.time() - t0
+
+    choice = resp.choices[0]
+    text = choice.message.content or ""
+
+    usage = resp.usage or {}
+    total_tokens = getattr(usage, "total_tokens", None) or 0
+    input_tokens = (
+        getattr(usage, "prompt_tokens", None)
+        or getattr(usage, "input_tokens", None)
+        or 0
+    )
+    output_tokens = (
+        getattr(usage, "completion_tokens", None)
+        or getattr(usage, "output_tokens", None)
+        or 0
+    )
+
+    log_event(
+        logger,
+        "openai_call_finished",
+        model=MODEL_NAME,
+        duration_ms=int(elapsed * 1000),
+        tokens_total=total_tokens,
+        tokens_in=input_tokens,
+        tokens_out=output_tokens,
+    )
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        log_event(logger, "openai_parse_error", level=logging.ERROR, raw_output=text)
+        raise HTTPException(400, "Model did not return valid JSON")
+
+    flights = data.get("flights") or []
+    connections = data.get("connections") or []
+
+    return {
+        "flights": flights,
+        "connections": connections,
+        "usage": {
+            "total_tokens": total_tokens,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        },
+    }
+
+
+# ------------------------------------------------------------------------------
+# ROUTES
+# ------------------------------------------------------------------------------
 
 @app.get("/health")
-async def health_check():
+async def health() -> Dict[str, Any]:
     return {
-        "status": "healthy",
-        "version": "8.1.0",
-        "timestamp": datetime.now().isoformat(),
+        "status": "ok",
+        "version": app.version,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
     }
 
 
-@app.get("/")
-async def root():
-    return {
-        "name": "Flight-Intel v8.1",
-        "description": "Maximum accuracy flight schedule extraction",
-        "endpoints": {
-            "/extract": "POST - Extract flights from image/PDF",
-            "/health": "GET - System health status",
-            "/docs": "GET - Interactive API documentation",
+@app.post("/extract", response_model=ExtractionResponse)
+async def extract(
+    request: Request,
+    file: UploadFile = File(...),
+    airline: Optional[str] = Query(None, description="Airline IATA code, e.g. FX, DL"),
+):
+    """
+    Main API pipeline
+    """
+    overall_start = time.time()
+
+    log_event(
+        logger,
+        "file_processing_started",
+        field_filename=file.filename,
+        content_type=file.content_type,
+    )
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "Empty file")
+
+    img_stats = _analyse_image_quality(file_bytes)
+    log_event(logger, "image_analysis", **img_stats)
+
+    # Step 2: extraction via OpenAI
+    page_t0 = time.time()
+    log_event(logger, "page_processing_started", page_number=1)
+
+    extraction_raw = await _openai_extract_flights(file_bytes, airline)
+
+    page_elapsed = time.time() - page_t0
+
+    # Raw flights straight from model
+    flights_raw: List[Dict[str, Any]] = extraction_raw["flights"]
+
+    # Filter out any flights with missing/blank flight_no BEFORE validation
+    cleaned_flights: List[Dict[str, Any]] = []
+    dropped_missing_flight_no = 0
+
+    for f in flights_raw:
+        fn = (f.get("flight_no") or "").strip()
+        if not fn:
+            dropped_missing_flight_no += 1
+            log_event(
+                logger,
+                "flight_skipped_missing_flight_no",
+                raw=f,
+            )
+            continue
+        f["flight_no"] = fn  # normalise whitespace
+        cleaned_flights.append(f)
+
+    if dropped_missing_flight_no:
+        log_event(
+            logger,
+            "flight_cleanup_summary",
+            total_raw=len(flights_raw),
+            kept=len(cleaned_flights),
+            dropped_missing_flight_no=dropped_missing_flight_no,
+        )
+
+    log_event(
+        logger,
+        "page_processing_finished",
+        page_number=1,
+        duration_ms=int(page_elapsed * 1000),
+        flights_found=len(cleaned_flights),
+    )
+
+    flights: List[Dict[str, Any]] = cleaned_flights
+    connections: List[Dict[str, Any]] = extraction_raw["connections"]
+    total_flights = len(flights)
+    avg_conf = (
+        sum(float(f.get("confidence") or 1.0) for f in flights) / total_flights
+        if total_flights
+        else 0.0
+    )
+
+    extraction_result: Dict[str, Any] = {
+        "flights": flights,
+        "connections": connections,
+        "total_flights_found": total_flights,
+        "avg_confidence": avg_conf,
+        "processing_time": {
+            "total_request": time.time() - overall_start,
+            "page_1_total": page_elapsed,
         },
-        "version": "8.1.0",
+        "extraction_method": "direct",
+        "metadata": {
+            "airline": {"iata": airline},
+            "file": {
+                "name": file.filename,
+                "type": file.content_type,
+                "size": len(file_bytes),
+                "pages": 1,
+            },
+        },
     }
 
+    # If no valid flights remain, skip validation gracefully
+    if total_flights == 0:
+        log_event(
+            logger,
+            "validation_skipped_no_valid_flights",
+        )
+        # Keep extraction_result, but still attach cost analysis below
+        extraction_validated = extraction_result
+    else:
+        # Run enrichment + schedule validation
+        validation_start = time.time()
+        log_event(logger, "validation_started", flights=total_flights)
+
+        extraction_validated = await validate_extraction_results(extraction_result)
+
+        log_event(
+            logger,
+            "validation_finished",
+            duration_ms=int((time.time() - validation_start) * 1000),
+        )
+
+    # Cost estimation
+    usage = extraction_raw["usage"]
+    input_cost = (usage["input_tokens"] / 1_000_000) * 2.50
+    output_cost = (usage["output_tokens"] / 1_000_000) * 10.00
+    total_cost = input_cost + output_cost
+
+    extraction_validated["cost_analysis"] = {
+        "total_tokens": usage["total_tokens"],
+        "total_cost_usd": round(total_cost, 4),
+        "api_calls": 1,
+    }
+
+    log_event(
+        logger,
+        "http_request_pipeline_completed",
+        filename=file.filename,
+        airline=airline,
+        flights_found=total_flights,
+        duration_ms=int((time.time() - overall_start) * 1000),
+    )
+
+    return extraction_validated
