@@ -31,6 +31,9 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Pattern
 import random
+from dotenv import load_dotenv
+
+load_dotenv()
 
 try:
     from zoneinfo import ZoneInfo
@@ -60,12 +63,13 @@ FLIGHTAWARE_API_KEY: Optional[str] = os.getenv("FLIGHTAWARE_API_KEY")
 FLIGHTRADAR24_API_KEY: Optional[str] = os.getenv("FLIGHTRADAR24_API_KEY")
 
 AEROAPI_BASE_URL = "https://aeroapi.flightaware.com/aeroapi"  # v4 path
-FR24_BASE_URL = "https://api.flightradar24.com/common/v1"     # FR24 public app API
+FR24_BASE_URL = "https://api.flightradar24.com/common/v1"  # FR24 public app API
 
 # Rate limiting / concurrency knobs
-AEROAPI_MAX_RPS = float(os.getenv("AEROAPI_MAX_RPS", "10"))   # steady tokens per second
-AEROAPI_BURST = int(os.getenv("AEROAPI_BURST", "3"))         # bucket capacity
+AEROAPI_MAX_RPS = float(os.getenv("AEROAPI_MAX_RPS", "10"))  # steady tokens per second
+AEROAPI_BURST = int(os.getenv("AEROAPI_BURST", "3"))  # bucket capacity
 VALIDATOR_CONCURRENCY = int(os.getenv("VALIDATOR_CONCURRENCY", "1"))
+AVIATION_EDGE_API_KEY: Optional[str] = os.getenv("AVIATION_EDGE_KEY")
 
 # Cache: (flight_no_upper, date_mmddyyyy) -> (ts, ValidationResult)
 _VALIDATION_CACHE: Dict[Tuple[str, str], Tuple[float, "ValidationResult"]] = {}
@@ -82,7 +86,24 @@ _AERO_CACHE_TTL = 30.0  # seconds
 
 # Examples: DL9013, DAL9013, 9E1234, UA1, AA12345, AF1234A
 FLIGHT_PATTERN: Pattern[str] = _re.compile(r"^[A-Z0-9]{2,4}\d{1,5}[A-Z]?$")
-_IDENT_SPLIT_RE: Pattern[str] = _re.compile(r"^([A-Z]{2,3})?(\d{1,5})([A-Z]?)$")
+_IDENT_SPLIT_RE: Pattern[str] = _re.compile(
+    r"^([A-Z]{3}|[A-Z0-9]{2})?(\d{1,5})([A-Z]?)$"
+)
+
+# Right after the import section, add:
+print("=" * 60)
+print("🔑 API KEY DEBUG:")
+print(
+    f"   FLIGHTAWARE_API_KEY: {'SET' if FLIGHTAWARE_API_KEY else 'MISSING'} (len={len(FLIGHTAWARE_API_KEY or '')})"
+)
+print(
+    f"   FLIGHTRADAR24_API_KEY: {'SET' if FLIGHTRADAR24_API_KEY else 'MISSING'} (len={len(FLIGHTRADAR24_API_KEY or '')})"
+)
+print(
+    f"   AVIATION_EDGE_API_KEY: {'SET' if AVIATION_EDGE_API_KEY else 'MISSING'} (len={len(AVIATION_EDGE_API_KEY or '')})"
+)
+print("=" * 60)
+
 
 def _split_ident(ident: str) -> Tuple[Optional[str], str, Optional[str]]:
     """
@@ -96,6 +117,7 @@ def _split_ident(ident: str) -> Tuple[Optional[str], str, Optional[str]]:
         return None, ident.strip().upper(), None
     return (m.group(1), m.group(2), m.group(3) or None)
 
+
 @lru_cache(maxsize=256)
 def _iso_day_window_utc(year: int, month: int, day: int) -> Tuple[str, str]:
     start = datetime(year, month, day, tzinfo=timezone.utc)
@@ -104,6 +126,7 @@ def _iso_day_window_utc(year: int, month: int, day: int) -> Tuple[str, str]:
         start.isoformat().replace("+00:00", "Z"),
         end.isoformat().replace("+00:00", "Z"),
     )
+
 
 @lru_cache(maxsize=512)
 def _to_iata(code: Optional[str]) -> Optional[str]:
@@ -115,6 +138,7 @@ def _to_iata(code: Optional[str]) -> Optional[str]:
     if len(c) == 4 and c.startswith("K"):  # simple KXXX→XXX (US ICAO)
         return c[1:]
     return None
+
 
 def _normalize_airport_fast(obj: Any) -> Optional[str]:
     """
@@ -130,30 +154,58 @@ def _normalize_airport_fast(obj: Any) -> Optional[str]:
                 return _to_iata(str(obj[key]))
     return None
 
+
 # Minimal, high-hit map of US airports → tz
 AIRPORT_TIMEZONES: Dict[str, str] = {
     # Eastern
-    "JFK": "America/New_York", "LGA": "America/New_York", "EWR": "America/New_York",
-    "ATL": "America/New_York", "BOS": "America/New_York", "DCA": "America/New_York",
-    "MIA": "America/New_York", "MCO": "America/New_York", "TPA": "America/New_York",
-    "PHL": "America/New_York", "CLT": "America/New_York", "BWI": "America/New_York",
-    "DTW": "America/Detroit", "JAX": "America/New_York",
+    "JFK": "America/New_York",
+    "LGA": "America/New_York",
+    "EWR": "America/New_York",
+    "ATL": "America/New_York",
+    "BOS": "America/New_York",
+    "DCA": "America/New_York",
+    "MIA": "America/New_York",
+    "MCO": "America/New_York",
+    "TPA": "America/New_York",
+    "PHL": "America/New_York",
+    "CLT": "America/New_York",
+    "BWI": "America/New_York",
+    "DTW": "America/Detroit",
+    "JAX": "America/New_York",
     # Central
-    "ORD": "America/Chicago", "MDW": "America/Chicago", "DFW": "America/Chicago",
-    "IAH": "America/Chicago", "MSP": "America/Chicago", "STL": "America/Chicago",
-    "MCI": "America/Chicago", "MKE": "America/Chicago", "MSY": "America/Chicago",
-    "BNA": "America/Chicago", "AUS": "America/Chicago", "SAT": "America/Chicago",
+    "ORD": "America/Chicago",
+    "MDW": "America/Chicago",
+    "DFW": "America/Chicago",
+    "IAH": "America/Chicago",
+    "MSP": "America/Chicago",
+    "STL": "America/Chicago",
+    "MCI": "America/Chicago",
+    "MKE": "America/Chicago",
+    "MSY": "America/Chicago",
+    "BNA": "America/Chicago",
+    "AUS": "America/Chicago",
+    "SAT": "America/Chicago",
     # Mountain
-    "DEN": "America/Denver", "SLC": "America/Denver", "PHX": "America/Phoenix",
+    "DEN": "America/Denver",
+    "SLC": "America/Denver",
+    "PHX": "America/Phoenix",
     # Pacific
-    "LAX": "America/Los_Angeles", "SFO": "America/Los_Angeles", "SEA": "America/Los_Angeles",
-    "SAN": "America/Los_Angeles", "PDX": "America/Los_Angeles", "LAS": "America/Los_Angeles",
-    "SJC": "America/Los_Angeles", "OAK": "America/Los_Angeles", "SMF": "America/Los_Angeles",
+    "LAX": "America/Los_Angeles",
+    "SFO": "America/Los_Angeles",
+    "SEA": "America/Los_Angeles",
+    "SAN": "America/Los_Angeles",
+    "PDX": "America/Los_Angeles",
+    "LAS": "America/Los_Angeles",
+    "SJC": "America/Los_Angeles",
+    "OAK": "America/Los_Angeles",
+    "SMF": "America/Los_Angeles",
     # Alaska/Hawaii
-    "ANC": "America/Anchorage", "HNL": "Pacific/Honolulu",
+    "ANC": "America/Anchorage",
+    "HNL": "Pacific/Honolulu",
 }
 _TZ_CACHE: Dict[str, ZoneInfo] = {k: ZoneInfo(v) for k, v in AIRPORT_TIMEZONES.items()}
 _DEFAULT_TZ = ZoneInfo("America/New_York")
+
 
 def _to_local_hhmm_from_iso(iso: str, airport_iata: Optional[str]) -> Optional[str]:
     if not iso:
@@ -165,7 +217,10 @@ def _to_local_hhmm_from_iso(iso: str, airport_iata: Optional[str]) -> Optional[s
     except Exception:
         return None
 
-def _to_local_hhmm_from_epoch_utc(epoch: Optional[int], airport_iata: Optional[str]) -> Optional[str]:
+
+def _to_local_hhmm_from_epoch_utc(
+    epoch: Optional[int], airport_iata: Optional[str]
+) -> Optional[str]:
     """
     FR24 fields are in epoch seconds (UTC). Convert to local HHMM using airport tz.
     """
@@ -178,9 +233,11 @@ def _to_local_hhmm_from_epoch_utc(epoch: Optional[int], airport_iata: Optional[s
     except Exception:
         return None
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MODELS
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class ValidationResult(BaseModel):
     is_valid: bool
@@ -193,6 +250,7 @@ class ValidationResult(BaseModel):
     class Config:
         validate_assignment = False
         use_enum_values = True
+
 
 class EnrichedFlight(BaseModel):
     date: str
@@ -207,12 +265,15 @@ class EnrichedFlight(BaseModel):
         validate_assignment = False
         use_enum_values = True
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RATE LIMITER
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class _AsyncTokenBucket:
     """Simple async token bucket limiter."""
+
     def __init__(self, rate: float, burst: int):
         self.rate = float(rate)
         self.capacity = float(burst)
@@ -233,9 +294,11 @@ class _AsyncTokenBucket:
             else:
                 self.tokens -= n
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AEROAPI CLIENT (FlightAware)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class AeroAPIClient:
     """
@@ -283,9 +346,12 @@ class AeroAPIClient:
         *,
         origin_hint: Optional[str] = None,
         dest_hint: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]:
         """
-        Returns a single best-match flight dict or None.
+        Returns flight data:
+        - Single dict if only one match OR all data is complete
+        - List of dicts if multiple matches AND data is incomplete
+        - None if no matches found
         """
         if not self._session:
             return None
@@ -303,9 +369,14 @@ class AeroAPIClient:
             logger.error(f"AeroAPI: bad date '{date_mmddyyyy}'")
             return None
 
-        day_start_iso, day_end_iso = _iso_day_window_utc(flight_dt.year, flight_dt.month, flight_dt.day)
+        day_start_iso, day_end_iso = _iso_day_window_utc(
+            flight_dt.year, flight_dt.month, flight_dt.day
+        )
         days_delta = (flight_dt.date() - datetime.utcnow().date()).days
 
+        # 🔥 Determine if we have incomplete data
+        has_incomplete_data = not all([origin_hint, dest_hint])  # Missing origin or dest
+        
         # Shared schedules params
         S_PARAMS = {
             "include_codeshares": "false",
@@ -323,7 +394,9 @@ class AeroAPIClient:
             hit = _AERO_RESP_CACHE.get(key)
             if hit and (now - hit[0] < _AERO_CACHE_TTL):
                 status, body = 200, hit[1]
-                logger.info(f"AeroAPI GET (cache) {path} params={params} status={status}")
+                logger.info(
+                    f"AeroAPI GET (cache) {path} params={params} status={status}"
+                )
                 return status, body, 0.0
 
             t0 = now
@@ -336,27 +409,37 @@ class AeroAPIClient:
                         body = await r.json()
                     except Exception:
                         body = await r.text()
-                    logger.info(f"AeroAPI GET {path} params={params} status={status} took={elapsed:.2f}s")
+                    logger.info(
+                        f"AeroAPI GET {path} params={params} status={status} took={elapsed:.2f}s"
+                    )
 
                     if status == 429 and attempt < attempts - 1:
                         ra = r.headers.get("Retry-After")
                         if ra:
                             try:
-                                await asyncio.sleep(float(ra) + 0.5)  # Add extra 0.5s buffer
+                                await asyncio.sleep(
+                                    float(ra) + 0.5
+                                )  # Add extra 0.5s buffer
                             except Exception:
                                 await asyncio.sleep(2.0)  # Increase from 0.8
                         else:
-                            await asyncio.sleep(2.0 + random.random())  # Increase base delay
+                            await asyncio.sleep(
+                                2.0 + random.random()
+                            )  # Increase base delay
                         continue
 
                     if status == 200:
                         _AERO_RESP_CACHE[key] = (time.perf_counter(), body)
                         if path.startswith("/schedules") and isinstance(body, dict):
                             if "scheduled" in body:
-                                logger.info(f"   Found {len(body['scheduled'])} scheduled flights")
-                                if body['scheduled']:
-                                    first = body['scheduled'][0]
-                                    logger.info(f"   First flight: {first.get('ident_iata')} from {first.get('origin_iata')} to {first.get('destination_iata')}")
+                                logger.info(
+                                    f"   Found {len(body['scheduled'])} scheduled flights"
+                                )
+                                if body["scheduled"]:
+                                    first = body["scheduled"][0]
+                                    logger.info(
+                                        f"   First flight: {first.get('ident_iata')} from {first.get('origin_iata')} to {first.get('destination_iata')}"
+                                    )
                         return status, body, elapsed
                     return status, body, elapsed
             return status, body, elapsed
@@ -366,10 +449,17 @@ class AeroAPIClient:
 
         if days_delta < -10:
             # Older than ~10 days → /history
-            phaseA.append((f"/history/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
+            phaseA.append(
+                (
+                    f"/history/flights/{ident}",
+                    {"start": day_start_iso, "end": day_end_iso},
+                )
+            )
         elif -10 <= days_delta <= 2:
             # within 2 days → /flights
-            phaseA.append((f"/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
+            phaseA.append(
+                (f"/flights/{ident}", {"start": day_start_iso, "end": day_end_iso})
+            )
         else:
             # Future/schedules window → airline+flight_number first
             airline, number, _suffix = _split_ident(ident)
@@ -377,28 +467,87 @@ class AeroAPIClient:
                 params = {"flight_number": number, **S_PARAMS}
                 if airline:
                     params["airline"] = airline
-                phaseA.append((
-                    f"/schedules/{flight_dt.strftime('%Y-%m-%d')}/{(flight_dt + timedelta(days=1)).strftime('%Y-%m-%d')}",
-                    params
-                ))
+                phaseA.append(
+                    (
+                        f"/schedules/{flight_dt.strftime('%Y-%m-%d')}/{(flight_dt + timedelta(days=1)).strftime('%Y-%m-%d')}",
+                        params,
+                    )
+                )
 
         # Always allow cross-try of flights/history to be safe (won't match far future)
         def _have(prefix: str, arr: List[Tuple[str, Dict[str, Any]]]) -> bool:
             return any(p.startswith(prefix) for p, _ in arr)
 
         if not _have("/flights/", phaseA):
-            phaseA.append((f"/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
+            phaseA.append(
+                (f"/flights/{ident}", {"start": day_start_iso, "end": day_end_iso})
+            )
         if not _have("/history/", phaseA):
-            phaseA.append((f"/history/flights/{ident}", {"start": day_start_iso, "end": day_end_iso}))
+            phaseA.append(
+                (
+                    f"/history/flights/{ident}",
+                    {"start": day_start_iso, "end": day_end_iso},
+                )
+            )
 
         last_error_text: Optional[str] = None
 
-        # Helper to parse and pick an item
+        # 🔥 NEW: Helper to extract ALL matching items
+        def _extract_all_items(body: Any) -> List[Dict[str, Any]]:
+            """Extract ALL flights that match the ident."""
+            if not isinstance(body, dict):
+                return []
+            
+            flights_list: List[Dict[str, Any]] = []
+
+            # Get the flights array from various response formats
+            if "scheduled" in body and isinstance(body["scheduled"], list):
+                flights_list = body["scheduled"]
+            elif "flights" in body and isinstance(body["flights"], list):
+                flights_list = body["flights"]
+            elif "data" in body and isinstance(body["data"], list):
+                flights_list = body["data"]
+            else:
+                for key, val in body.items():
+                    if isinstance(val, list) and val and isinstance(val[0], dict):
+                        flights_list = val
+                        break
+
+            if not flights_list:
+                return []
+
+            # Filter to only matching flights
+            def _matches_ident(f: Dict[str, Any]) -> bool:
+                # Check all possible ident fields
+                for k in ("ident", "ident_iata", "ident_icao", "flight_number"):
+                    v = f.get(k)
+                    if isinstance(v, str):
+                        v_clean = v.strip().upper()
+                        # Direct match
+                        if v_clean == ident:
+                            return True
+                        # Match without airline prefix (e.g., "DAL9013" matches "DL9013")
+                        if v_clean.endswith(ident[2:]) and len(v_clean) > len(ident):
+                            return True
+
+                # Also check by flight number alone
+                airline, number, _sfx = _split_ident(ident)
+                if number:
+                    fn = str(f.get("flight_number") or "").strip()
+                    if fn == number:
+                        return True
+
+                return False
+
+            matching = [item for item in flights_list if _matches_ident(item)]
+            return matching
+
+        # Helper to parse and pick first item (existing logic)
         def _extract_first_item(body: Any) -> Optional[Dict[str, Any]]:
             if not isinstance(body, dict):
                 return None
             flights_list: List[Dict[str, Any]] = []
-            
+
             # Add "scheduled" to the list of fields to check (this is what /schedules returns)
             if "scheduled" in body and isinstance(body["scheduled"], list):
                 flights_list = body["scheduled"]
@@ -411,7 +560,7 @@ class AeroAPIClient:
                     if isinstance(val, list) and val and isinstance(val[0], dict):
                         flights_list = val
                         break
-            
+
             if not flights_list:
                 return None
 
@@ -428,14 +577,14 @@ class AeroAPIClient:
                         # Match without airline prefix (e.g., "DAL9013" matches "DL9013")
                         if v_clean.endswith(ident[2:]) and len(v_clean) > len(ident):
                             return True
-                
+
                 # Also check by flight number alone
                 airline, number, _sfx = _split_ident(ident)
                 if number:
                     fn = str(f.get("flight_number") or "").strip()
                     if fn == number:
                         return True
-                
+
                 return False
 
             for item in flights_list:
@@ -455,12 +604,24 @@ class AeroAPIClient:
             if status in (404, 204):
                 continue
             if status != 200:
-                last_error_text = body if isinstance(body, str) else json.dumps(body)[:200]
+                last_error_text = (
+                    body if isinstance(body, str) else json.dumps(body)[:200]
+                )
                 continue
 
-            item = _extract_first_item(body)
-            if item:
-                return item
+            # 🔥 NEW: If data incomplete, try to get all matches
+            if has_incomplete_data:
+                items = _extract_all_items(body)
+                if len(items) > 1:
+                    logger.info(f"   📋 Found {len(items)} matching flights - returning all due to incomplete data")
+                    return items
+                elif len(items) == 1:
+                    return items[0]
+            else:
+                # Complete data - just get best match
+                item = _extract_first_item(body)
+                if item:
+                    return item
 
         # Phase B — only if Phase A yielded nothing: try route-based schedules
         # Use hints if available from extractor (dest first; include origin if present)
@@ -474,25 +635,40 @@ class AeroAPIClient:
             route_tries.append(p)
         # If no dest hint, try origin-only (less precise but sometimes returns one)
         if origin_hint and not dest_hint:
-            route_tries.append({"airline": airline or "DL", "origin": origin_hint, **S_PARAMS})
+            route_tries.append(
+                {"airline": airline or "DL", "origin": origin_hint, **S_PARAMS}
+            )
 
         for params in route_tries:
             status, body, _elapsed = await _do_get(sched_path, params)
 
             if status == 400:
                 err_txt = body if isinstance(body, str) else json.dumps(body)[:200]
-                logger.error(f"AeroAPI 400 on {sched_path} params={params} err={err_txt}")
+                logger.error(
+                    f"AeroAPI 400 on {sched_path} params={params} err={err_txt}"
+                )
                 last_error_text = err_txt
                 continue
             if status in (404, 204):
                 continue
             if status != 200:
-                last_error_text = body if isinstance(body, str) else json.dumps(body)[:200]
+                last_error_text = (
+                    body if isinstance(body, str) else json.dumps(body)[:200]
+                )
                 continue
 
-            item = _extract_first_item(body)
-            if item:
-                return item
+            # 🔥 NEW: Same logic for Phase B
+            if has_incomplete_data:
+                items = _extract_all_items(body)
+                if len(items) > 1:
+                    logger.info(f"   📋 Found {len(items)} matching flights - returning all due to incomplete data")
+                    return items
+                elif len(items) == 1:
+                    return items[0]
+            else:
+                item = _extract_first_item(body)
+                if item:
+                    return item
 
         if last_error_text:
             logger.error(f"AeroAPI no data; last error: {last_error_text}")
@@ -502,27 +678,45 @@ class AeroAPIClient:
 # FLIGHTRADAR24 CLIENT (best-effort)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+# flight_intel_patch.py - REPLACE the FR24Client class
+
 class FR24Client:
     """
-    Lightweight FR24 fetcher. Public app endpoints shift occasionally; this is a best-effort helper.
-    We only rely on it as a supplemental source.
-
+    FlightRadar24 API client with enterprise-grade reliability matching AeroAPIClient.
+    
+    Rate limit: 30 requests/minute (Essential Plan)
+    Features: Token bucket limiter, response caching, 429 retry, multiple result handling
+    
     Endpoint used:
-      - GET /flight/list.json?query={IDENT}&fetchBy=flight&limit=10&token={API_KEY}
-
-    Output (typical):
-      { "result": { "response": { "data": [ { "airport": { origin: { code: { iata: "SFO" }}, destination: {...}}, "time": { "scheduled": { "departure": 163..., "arrival": 163... } } } ] } } }
+      - GET /flight/list.json?query={IDENT}&fetchBy=flight&limit=25&token={API_KEY}
     """
 
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
         self._session: Optional[aiohttp.ClientSession] = None
-        self._connector = aiohttp.TCPConnector(limit=20, limit_per_host=10, ttl_dns_cache=300)
+        self._connector = aiohttp.TCPConnector(
+            limit=20,
+            limit_per_host=10,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+            keepalive_timeout=30,
+        )
+        # Rate limiting: 30/min = 0.5/sec with burst capacity of 5
+        self._limiter = _AsyncTokenBucket(rate=0.5, burst=5)
+        
+        # Response cache: (ident, date) -> (timestamp, data)
+        self._cache: Dict[Tuple[str, str], Tuple[float, Any]] = {}
+        self._cache_ttl = 30.0  # seconds
+        self._cache_max_size = 200
 
     async def __aenter__(self) -> "FR24Client":
-        timeout = aiohttp.ClientTimeout(total=10, connect=3)
+        timeout = aiohttp.ClientTimeout(total=15, connect=4)
         self._session = aiohttp.ClientSession(
-            headers={"Accept": "application/json", "User-Agent": "Flight-Intel/2.3"},
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "Flight-Intel/2.3",
+            },
             connector=self._connector,
             timeout=timeout,
         )
@@ -532,73 +726,247 @@ class FR24Client:
         if self._session:
             await self._session.close()
 
-    async def search(self, flight_no: str, date_mmddyyyy: str) -> Optional[Dict[str, Any]]:
+    def _get_from_cache(self, ident: str, date: str) -> Optional[Any]:
+        """Check response cache for recent identical request."""
+        key = (ident.upper(), date)
+        if key in self._cache:
+            ts, data = self._cache[key]
+            if time.perf_counter() - ts < self._cache_ttl:
+                logger.info(f"FR24 cache HIT for {ident} on {date}")
+                return data
+            else:
+                # Expired entry
+                del self._cache[key]
+        return None
+
+    def _put_in_cache(self, ident: str, date: str, data: Any) -> None:
+        """Store successful response in cache."""
+        key = (ident.upper(), date)
+        self._cache[key] = (time.perf_counter(), data)
+        
+        # Evict oldest entries if cache is full
+        if len(self._cache) > self._cache_max_size:
+            oldest_key = min(self._cache.items(), key=lambda x: x[1][0])[0]
+            del self._cache[oldest_key]
+
+    async def _do_get(
+        self, url: str, params: Dict[str, Any], attempt: int = 1
+    ) -> Tuple[int, Any, float]:
+        """
+        Execute GET request with rate limiting, caching, and retry logic.
+        Returns: (status_code, response_data, elapsed_time)
+        """
+        # Apply rate limiting
+        await self._limiter.acquire()
+        
+        t0 = time.perf_counter()
+        max_attempts = 3
+        
+        for retry in range(max_attempts):
+            try:
+                async with self._session.get(url, params=params) as r:
+                    elapsed = time.perf_counter() - t0
+                    status = r.status
+                    
+                    # Parse response
+                    try:
+                        body = await r.json()
+                    except Exception:
+                        body = await r.text()
+                    
+                    logger.info(
+                        f"FR24 GET {url.split('/')[-1]} "
+                        f"status={status} took={elapsed:.2f}s attempt={retry+1}/{max_attempts}"
+                    )
+                    
+                    # Handle 429 rate limit
+                    if status == 429 and retry < max_attempts - 1:
+                        retry_after = r.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                wait_time = float(retry_after) + 1.0  # Add buffer
+                            except ValueError:
+                                wait_time = 3.0
+                        else:
+                            # Exponential backoff with jitter
+                            wait_time = (2 ** retry) + random.uniform(0.5, 2.0)
+                        
+                        logger.warning(
+                            f"FR24 429 rate limit hit - waiting {wait_time:.1f}s before retry"
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    
+                    # Handle other errors
+                    if status != 200:
+                        error_text = body if isinstance(body, str) else json.dumps(body)[:200]
+                        logger.error(f"FR24 error {status}: {error_text}")
+                    
+                    return status, body, elapsed
+                    
+            except asyncio.TimeoutError:
+                logger.error(f"FR24 timeout on attempt {retry+1}/{max_attempts}")
+                if retry < max_attempts - 1:
+                    await asyncio.sleep(1.0 + random.uniform(0, 0.5))
+                    continue
+                return 504, None, time.perf_counter() - t0
+                
+            except Exception as e:
+                logger.error(f"FR24 exception on attempt {retry+1}/{max_attempts}: {e}")
+                if retry < max_attempts - 1:
+                    await asyncio.sleep(1.0)
+                    continue
+                return 500, None, time.perf_counter() - t0
+        
+        # All retries exhausted
+        return status, body, time.perf_counter() - t0
+
+    async def search(
+        self,
+        flight_no: str,
+        date_mmddyyyy: str,
+        *,
+        origin_hint: Optional[str] = None,
+        dest_hint: Optional[str] = None,
+    ) -> Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]:
+        """
+        Search for flight data on FR24.
+        
+        Returns:
+        - Single dict if only one match OR data is complete
+        - List of dicts if multiple matches AND data is incomplete
+        - None if no matches found
+        
+        Args:
+            flight_no: Flight number (e.g., "DL9013")
+            date_mmddyyyy: Date string "MM/DD/YYYY"
+            origin_hint: Optional origin airport code for validation
+            dest_hint: Optional destination airport code for validation
+        """
         if not self._session or not self._api_key:
+            logger.warning("FR24 client not initialized or missing API key")
             return None
 
         ident = flight_no.strip().upper()
+        
+        # Check cache first
+        cached = self._get_from_cache(ident, date_mmddyyyy)
+        if cached is not None:
+            return cached
+        
+        # Build request params
         params = {
             "query": ident,
             "fetchBy": "flight",
-            "limit": 10,
+            "limit": 25,  # Increased to catch more potential matches
             "token": self._api_key,
         }
+        
         url = f"{FR24_BASE_URL}/flight/list.json"
-        t0 = time.perf_counter()
-        try:
-            async with self._session.get(url, params=params) as r:
-                elapsed = time.perf_counter() - t0
-                logger.info(f"FR24 GET list status={r.status} took={elapsed:.2f}s")
-                if r.status != 200:
-                    txt = await r.text()
-                    logger.error(f"FR24 error {r.status}: {txt[:200]}")
-                    return None
-                data = await r.json()
-        except asyncio.TimeoutError:
-            logger.error("FR24 timeout")
+        
+        # Execute request with retry logic
+        status, body, elapsed = await self._do_get(url, params)
+        
+        if status != 200 or not body:
             return None
+        
+        # Parse response structure
+        try:
+            flights = body.get("result", {}).get("response", {}).get("data", [])
+            if not flights:
+                logger.info(f"FR24 no flights found for {ident}")
+                return None
+            
+            logger.info(f"FR24 found {len(flights)} potential matches for {ident}")
+            
+            # Filter to exact matches only
+            def _matches_ident(flight_data: Dict[str, Any]) -> bool:
+                """Check if flight matches our search ident."""
+                # FR24 structure: flight_data contains various identifying fields
+                for key in ("identification", "flight", "airline"):
+                    if key in flight_data:
+                        obj = flight_data[key]
+                        if isinstance(obj, dict):
+                            # Check number field
+                            number = obj.get("number", {})
+                            if isinstance(number, dict):
+                                default_num = number.get("default", "").upper()
+                                if default_num == ident:
+                                    return True
+                            # Check callsign
+                            callsign = obj.get("callsign", "").upper()
+                            if callsign == ident:
+                                return True
+                
+                return False
+            
+            matching_flights = [f for f in flights if _matches_ident(f)]
+            
+            if not matching_flights:
+                # No exact matches, return first result as best guess
+                logger.warning(f"FR24 no exact match for {ident}, using first result")
+                result = flights[0]
+                self._put_in_cache(ident, date_mmddyyyy, result)
+                return result
+            
+            # Determine if we have incomplete data
+            has_incomplete_data = not all([origin_hint, dest_hint])
+            
+            # If data is incomplete and we have multiple matches, return all
+            if has_incomplete_data and len(matching_flights) > 1:
+                logger.info(
+                    f"FR24 returning {len(matching_flights)} options for {ident} "
+                    f"(incomplete data: origin={bool(origin_hint)}, dest={bool(dest_hint)})"
+                )
+                self._put_in_cache(ident, date_mmddyyyy, matching_flights)
+                return matching_flights
+            
+            # Otherwise return best single match
+            result = matching_flights[0]
+            logger.info(f"FR24 returning single best match for {ident}")
+            self._put_in_cache(ident, date_mmddyyyy, result)
+            return result
+            
         except Exception as e:
-            logger.error(f"FR24 exception: {e}")
+            logger.error(f"FR24 response parsing error: {e}")
             return None
-
-        try:
-            flights = (
-                data.get("result", {})
-                    .get("response", {})
-                    .get("data") or []
-            )
-            if flights:
-                return flights[0]
-        except Exception:
-            pass
-        return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AVIATION EDGE CLIENT (Cargo-focused)
 # ─────────────────────────────────────────────────────────────────────────────
 
-AVIATION_EDGE_API_KEY: Optional[str] = os.getenv("AVIATION_EDGE_KEY")
 AVIATION_EDGE_BASE = "https://aviation-edge.com/v2/public"
 
 # Cargo carriers that should prefer Aviation Edge
 CARGO_CARRIERS = {
-    "5X", "UPS",  # UPS
-    "FX", "FDX",  # FedEx
-    "5Y", "GTI",  # Atlas Air
-    "K4", "CKS",  # Kalitta Air
-    "NC", "NAC",  # Northern Air Cargo
-    "GB", "ABX",  # ABX Air
-    "3S", "PAC",  # Polar Air Cargo
-    "M6", "AJT",  # Amerijet
-    "CV", "CLX",  # Cargolux
-    "KZ", "NCA",  # Nippon Cargo
-    "PO",         # Polar Air Cargo (alternate code)
+    "5X",
+    "UPS",  # UPS
+    "FX",
+    "FDX",  # FedEx
+    "5Y",
+    "GTI",  # Atlas Air
+    "K4",
+    "CKS",  # Kalitta Air
+    "NC",
+    "NAC",  # Northern Air Cargo
+    "GB",
+    "ABX",  # ABX Air
+    "3S",
+    "PAC",  # Polar Air Cargo
+    "M6",
+    "AJT",  # Amerijet
+    "CV",
+    "CLX",  # Cargolux
+    "KZ",
+    "NCA",  # Nippon Cargo
+    "PO",  # Polar Air Cargo (alternate code)
 }
+
 
 class AviationEdgeClient:
     """
     Aviation Edge API client optimized for cargo operations.
-    
+
     Endpoints used:
       - GET /timetable?iataCode={XXX}&type=departure - Real-time schedules
       - GET /flightsFuture?iataCode={XXX}&date={YYYY-MM-DD} - Future schedules
@@ -634,20 +1002,24 @@ class AviationEdgeClient:
         """Shared GET with key injection."""
         if not self._session:
             return 503, None
-        
+
         params["key"] = self._api_key
         url = f"{AVIATION_EDGE_BASE}/{endpoint}"
-        
+
         try:
             async with self._session.get(url, params=params) as r:
                 status = r.status
                 if status == 200:
                     data = await r.json()
-                    logger.info(f"Aviation Edge GET /{endpoint} status={status} results={len(data) if isinstance(data, list) else 'N/A'}")
+                    logger.info(
+                        f"Aviation Edge GET /{endpoint} status={status} results={len(data) if isinstance(data, list) else 'N/A'}"
+                    )
                     return status, data
                 else:
                     text = await r.text()
-                    logger.error(f"Aviation Edge GET /{endpoint} status={status} error={text[:200]}")
+                    logger.error(
+                        f"Aviation Edge GET /{endpoint} status={status} error={text[:200]}"
+                    )
                     return status, None
         except asyncio.TimeoutError:
             logger.error(f"Aviation Edge GET /{endpoint} TIMEOUT")
@@ -666,14 +1038,14 @@ class AviationEdgeClient:
     ) -> Optional[Dict[str, Any]]:
         """
         Search for cargo flight using multiple strategies.
-        
+
         Priority:
         1. /timetable (for today/tomorrow)
         2. /flightsFuture (for dates >2 days out)
         3. /routes (fallback for route validation)
         """
         ident = flight_no.strip().upper()
-        
+
         # Parse date
         try:
             m, d, y = [int(x) for x in date_mmddyyyy.split("/")]
@@ -684,10 +1056,10 @@ class AviationEdgeClient:
 
         days_delta = (flight_date.date() - datetime.utcnow().date()).days
         iso_date = flight_date.strftime("%Y-%m-%d")
-        
+
         # Extract airline + flight number
         airline, number, _sfx = _split_ident(ident)
-        
+
         # Strategy 1: Real-time timetable (for recent/today flights)
         if -2 <= days_delta <= 2 and origin_hint:
             params = {
@@ -695,28 +1067,38 @@ class AviationEdgeClient:
                 "type": "departure",
             }
             status, data = await self._get("timetable", params)
-            
+
             if status == 200 and isinstance(data, list):
                 # Filter by flight number
                 for item in data:
-                    flight_iata = (item.get("flight") or {}).get("iataNumber", "").upper()
+                    flight_iata = (
+                        (item.get("flight") or {}).get("iataNumber", "").upper()
+                    )
                     # Match DL9013 or just 9013
-                    if flight_iata == ident or (number and flight_iata.endswith(number)):
+                    if flight_iata == ident or (
+                        number and flight_iata.endswith(number)
+                    ):
                         return self._normalize_timetable(item)
 
         # Strategy 2: Future schedules (for dates >2 days out)
         if days_delta > 2:
             params = {
                 "type": "departure",
-                "iataCode": origin_hint or dest_hint or "JFK",  # Need at least one airport
+                "iataCode": origin_hint
+                or dest_hint
+                or "JFK",  # Need at least one airport
                 "date": iso_date,
             }
             status, data = await self._get("flightsFuture", params)
-            
+
             if status == 200 and isinstance(data, list):
                 for item in data:
-                    flight_iata = (item.get("flight") or {}).get("iataNumber", "").upper()
-                    if flight_iata == ident or (number and flight_iata.endswith(number)):
+                    flight_iata = (
+                        (item.get("flight") or {}).get("iataNumber", "").upper()
+                    )
+                    if flight_iata == ident or (
+                        number and flight_iata.endswith(number)
+                    ):
                         return self._normalize_future_schedule(item)
 
         # Strategy 3: Routes fallback (if we have origin + dest)
@@ -727,9 +1109,9 @@ class AviationEdgeClient:
             }
             if airline:
                 params["airlineIata"] = airline
-                
+
             status, data = await self._get("routes", params)
-            
+
             if status == 200 and isinstance(data, list):
                 # Routes don't have dates, but validate the route exists
                 for item in data:
@@ -742,8 +1124,12 @@ class AviationEdgeClient:
     def _normalize_timetable(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """Convert /timetable response to standard format."""
         return {
-            "origin": _normalize_airport_fast((item.get("departure") or {}).get("iataCode")),
-            "destination": _normalize_airport_fast((item.get("arrival") or {}).get("iataCode")),
+            "origin": _normalize_airport_fast(
+                (item.get("departure") or {}).get("iataCode")
+            ),
+            "destination": _normalize_airport_fast(
+                (item.get("arrival") or {}).get("iataCode")
+            ),
             "scheduled_out": (item.get("departure") or {}).get("scheduledTime"),
             "scheduled_in": (item.get("arrival") or {}).get("scheduledTime"),
             "flight": item.get("flight"),
@@ -755,7 +1141,7 @@ class AviationEdgeClient:
         """Convert /flightsFuture response to standard format."""
         dep = item.get("departure") or {}
         arr = item.get("arrival") or {}
-        
+
         return {
             "origin": _normalize_airport_fast(dep.get("iataCode")),
             "destination": _normalize_airport_fast(arr.get("iataCode")),
@@ -772,14 +1158,17 @@ class AviationEdgeClient:
             "destination": _normalize_airport_fast(item.get("arrivalIata")),
             "scheduled_out": None,
             "scheduled_in": None,
-            "flight": {"iataNumber": f"{item.get('airlineIata', '')}{item.get('flightNumber', '')}"},
+            "flight": {
+                "iataNumber": f"{item.get('airlineIata', '')}{item.get('flightNumber', '')}"
+            },
             "airline": {"iataCode": item.get("airlineIata")},
         }
-    
-    
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # VALIDATOR
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class FastFlightValidator:
     """
@@ -790,16 +1179,17 @@ class FastFlightValidator:
     def __init__(self) -> None:
         self._has_aero = bool(FLIGHTAWARE_API_KEY)
         self._has_fr24 = bool(FLIGHTRADAR24_API_KEY)
-        self._has_aviedge = bool(AVIATION_EDGE_API_KEY)
-        
-        self._aero: Optional[AeroAPIClient] = AeroAPIClient(FLIGHTAWARE_API_KEY) if self._has_aero else None
-        self._fr24: Optional[FR24Client] = FR24Client(FLIGHTRADAR24_API_KEY) if self._has_fr24 else None
-        self._aviedge: Optional[AviationEdgeClient] = AviationEdgeClient(AVIATION_EDGE_API_KEY) if self._has_aviedge else None
+
+        self._aero: Optional[AeroAPIClient] = (
+            AeroAPIClient(FLIGHTAWARE_API_KEY) if self._has_aero else None
+        )
+        self._fr24: Optional[FR24Client] = (
+            FR24Client(FLIGHTRADAR24_API_KEY) if self._has_fr24 else None
+        )
 
         logger.info("🔧 Validator initialized:")
         logger.info(f"   FlightAware API: {'✅' if self._has_aero else '❌'}")
         logger.info(f"   FR24 API: {'✅' if self._has_fr24 else '❌'}")
-        logger.info(f"   Aviation Edge API: {'✅' if self._has_aviedge else '❌'}")
 
     async def __aenter__(self) -> "FastFlightValidator":
         tasks = []
@@ -807,8 +1197,6 @@ class FastFlightValidator:
             tasks.append(self._aero.__aenter__())
         if self._fr24:
             tasks.append(self._fr24.__aenter__())
-        if self._aviedge:
-            tasks.append(self._aviedge.__aenter__())
         if tasks:
             await asyncio.gather(*tasks)
         return self
@@ -819,85 +1207,105 @@ class FastFlightValidator:
             tasks.append(self._aero.__aexit__(None, None, None))
         if self._fr24:
             tasks.append(self._fr24.__aexit__(None, None, None))
-        if self._aviedge:
-            tasks.append(self._aviedge.__aexit__(None, None, None))
         if tasks:
             await asyncio.gather(*tasks)
 
     def _is_cargo_flight(self, flight_no: str) -> bool:
-        """Detect if flight is cargo based on airline code."""
         airline, _num, _sfx = _split_ident(flight_no.upper())
-        return airline in CARGO_CARRIERS if airline else False
 
-    def _cache_get(self, flight_no: str, date: str) -> Optional[ValidationResult]:
-        key = (flight_no.upper(), date)
+        # 🔥 ADD THIS DEBUG LOGGING:
+        is_cargo = airline in CARGO_CARRIERS if airline else False
+        logger.info(
+            f"   🔍 Cargo detection: '{flight_no}' -> airline='{airline}' -> is_cargo={is_cargo}"
+        )
+        if airline and not is_cargo:
+            logger.info(
+                f"      Available cargo carriers: {sorted(CARGO_CARRIERS)[:10]}"
+            )
+
+        return is_cargo
+
+    def _cache_get(self, flight_no: str, date: str, flight: Dict[str, Any]) -> Optional[ValidationResult]:
+        """Cache key now includes data completeness to avoid wrong hits."""
+        # Include completeness in cache key
+        has_origin = bool(flight.get("origin"))
+        has_dest = bool(flight.get("dest"))
+        has_time = bool(flight.get("sched_out_local"))
+        
+        key = (flight_no.upper(), date, has_origin, has_dest, has_time)
         entry = _VALIDATION_CACHE.get(key)
         if entry and (time.time() - entry[0] < _CACHE_TTL_S):
-            logger.info(f"   📦 Cache hit for {key}")
+            logger.info(f"   📦 Cache hit for {flight_no} on {date}")
             return entry[1]
         return None
 
-    def _cache_put(self, flight_no: str, date: str, result: "ValidationResult") -> None:
-        key = (flight_no.upper(), date)
+    def _cache_put(self, flight_no: str, date: str, flight: Dict[str, Any], result: "ValidationResult") -> None:
+        """Cache key now includes data completeness."""
+        has_origin = bool(flight.get("origin"))
+        has_dest = bool(flight.get("dest"))
+        has_time = bool(flight.get("sched_out_local"))
+        
+        key = (flight_no.upper(), date, has_origin, has_dest, has_time)
         _VALIDATION_CACHE[key] = (time.time(), result)
         if len(_VALIDATION_CACHE) > _CACHE_MAX:
-            # drop ~10% oldest
             for _ in range(max(1, _CACHE_MAX // 10)):
                 try:
                     _VALIDATION_CACHE.pop(next(iter(_VALIDATION_CACHE)))
                 except Exception:
                     break
 
-    async def _validate_one(self, flight: Dict[str, Any]) -> ValidationResult:
+    async def _validate_one(self, flight: Dict[str, Any]) -> List[ValidationResult]:
+        """
+        Now returns LIST of ValidationResults.
+        - Single item list for normal flights
+        - Multiple items when multiple matches found
+        """
         flight_no = (flight.get("flight_no") or "").strip().upper()
         date = (flight.get("date") or "").strip()
 
         logger.info(f"🔍 Validating {flight_no} on {date}")
 
         if not flight_no or not date:
-            return ValidationResult(is_valid=False, confidence=0.0, source="none", warnings=["missing_fields"])
+            return [ValidationResult(
+                is_valid=False,
+                confidence=0.0,
+                source="none",
+                warnings=["missing_fields"],
+            )]
 
         # Cache check
-        cached = self._cache_get(flight_no, date)
+        cached = self._cache_get(flight_no, date, flight)
         if cached:
-            return cached
+            return [cached]  # 🔥 Return as list
 
         # Fast pass if already complete
-        if all(flight.get(k) for k in ("origin", "dest", "sched_out_local", "sched_in_local")):
+        if all(
+            flight.get(k)
+            for k in ("origin", "dest", "sched_out_local", "sched_in_local")
+        ):
             res = ValidationResult(is_valid=True, confidence=1.0, source="complete")
-            self._cache_put(flight_no, date, res)
-            return res
+            self._cache_put(flight_no, date, flight, res)
+            return [res]  # 🔥 Return as list
 
         filled: Dict[str, Any] = {}
         source_tags: List[str] = []
+        warnings: List[str] = []
         conf = 0.0
 
-        # 🎯 ROUTING LOGIC: Determine priority order
+        # 🎯 ROUTING LOGIC
         is_cargo = self._is_cargo_flight(flight_no)
-        
+
         if is_cargo:
-            logger.info(f"   🚛 Cargo flight detected - priority: Aviation Edge → FlightAware → FR24")
+            logger.info(f"   🚛 Cargo flight - priority: FR24 → FlightAware")
+            priority_order = ["fr24", "aeroapi"]
         else:
-            logger.info(f"   ✈️  Passenger flight detected - priority: FlightAware → Aviation Edge → FR24")
+            logger.info(f"   ✈️  Passenger flight - priority: FlightAware → FR24")
+            priority_order = ["aeroapi", "fr24"]
 
-        # Prepare API calls with priority order
-        api_results: List[Tuple[str, Optional[Dict[str, Any]]]] = []
-
-        async def _call_aviedge() -> None:
-            """Call Aviation Edge API."""
-            if not self._aviedge:
-                api_results.append(("aviedge", None))
-                return
-            data = await self._aviedge.search(
-                flight_no,
-                date,
-                origin_hint=_normalize_airport_fast(flight.get("origin")),
-                dest_hint=_normalize_airport_fast(flight.get("dest")),
-            )
-            api_results.append(("aviedge", data))
+        # API calls
+        api_results: List[Tuple[str, Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]]] = []
 
         async def _call_aero() -> None:
-            """Call FlightAware API."""
             if not self._aero:
                 api_results.append(("aeroapi", None))
                 return
@@ -910,78 +1318,110 @@ class FastFlightValidator:
             api_results.append(("aeroapi", data))
 
         async def _call_fr24() -> None:
-            """Call FR24 API."""
             if not self._fr24:
                 api_results.append(("fr24", None))
                 return
             data = await self._fr24.search(flight_no, date)
             api_results.append(("fr24", data))
 
-        # 🔥 NEW: Call ALL available APIs in parallel
-        # We'll process them in priority order afterwards
-        await asyncio.gather(_call_aviedge(), _call_aero(), _call_fr24())
+        # Call both APIs in parallel
+        await asyncio.gather(_call_aero(), _call_fr24())
 
-        # 🎯 Process results in priority order based on flight type
-        if is_cargo:
-            # Cargo priority: Aviation Edge > FlightAware > FR24
-            priority_order = ["aviedge", "aeroapi", "fr24"]
-        else:
-            # Passenger priority: FlightAware > Aviation Edge > FR24
-            priority_order = ["aeroapi", "aviedge", "fr24"]
-
-        # Sort api_results by priority
+        # Sort by priority
         api_results_sorted = sorted(
             api_results,
-            key=lambda x: priority_order.index(x[0]) if x[0] in priority_order else 999
+            key=lambda x: priority_order.index(x[0]) if x[0] in priority_order else 999,
         )
 
-        # Process in priority order, stop early if we get complete data
+        # Process results
         for tag, data in api_results_sorted:
             if not data:
                 continue
 
-            # Track what we had before this API call
+            # 🔥 HANDLE MULTIPLE RESULTS - RETURN ALL!
+            if isinstance(data, list) and len(data) > 1:
+                logger.info(f"   📋 {tag} returned {len(data)} options - RETURNING ALL")
+                
+                # Process ALL options
+                all_results = []
+                for idx, item in enumerate(data):
+                    filled_temp: Dict[str, Any] = {}
+                    warnings_temp: List[str] = []
+                    
+                    if tag == "aeroapi":
+                        self._apply_aero_fields(item, flight, filled_temp, warnings_temp)
+                    elif tag == "fr24":
+                        self._apply_fr24_fields(item, flight, filled_temp, warnings_temp)
+                    
+                    if filled_temp:
+                        # Create separate ValidationResult for each option
+                        conf_temp = 0.95 if tag == "aeroapi" else 0.85
+                        warnings_temp.append(f"Option {idx + 1} of {len(data)}")
+                        
+                        all_results.append(ValidationResult(
+                            is_valid=True,
+                            confidence=conf_temp * 0.8,  # Lower confidence for multi-match
+                            source=f"{tag}",
+                            filled_fields=filled_temp,
+                            warnings=warnings_temp,
+                        ))
+                
+                if all_results:
+                    logger.info(f"   ✅ Returning {len(all_results)} options to frontend")
+                    return all_results  # 🔥 RETURN ALL OPTIONS
+                
+                # If no valid options, continue to next API
+                continue
+
+            # Handle single result
+            if isinstance(data, list):
+                data = data[0] if data else None
+                if not data:
+                    continue
+
+            # Track fields before
             fields_before = set(filled.keys())
 
-            if tag == "aviedge":
-                self._apply_aviedge_fields(data, flight, filled)
-                if len(filled) > len(fields_before):  # New fields added
-                    source_tags.append("aviation_edge")
-                    conf = max(conf, 0.90)
-            elif tag == "aeroapi":
-                self._apply_aero_fields(data, flight, filled)
-                if len(filled) > len(fields_before):  # New fields added
+            if tag == "aeroapi":
+                self._apply_aero_fields(data, flight, filled, warnings)
+                if len(filled) > len(fields_before):
                     source_tags.append("aeroapi")
                     conf = max(conf, 0.95)
             elif tag == "fr24":
-                self._apply_fr24_fields(data, flight, filled)
-                if len(filled) > len(fields_before):  # New fields added
+                self._apply_fr24_fields(data, flight, filled, warnings)
+                if len(filled) > len(fields_before):
                     source_tags.append("fr24")
                     conf = max(conf, 0.85)
 
-            # 🚀 EARLY EXIT: If we have all fields, stop calling more APIs
+            # Early exit if complete
             has_all = all(
-                filled.get(k) or flight.get(k) 
+                filled.get(k) or flight.get(k)
                 for k in ("origin", "dest", "sched_out_local", "sched_in_local")
             )
             if has_all:
-                logger.info(f"   ✅ All fields complete after {tag} - skipping remaining APIs")
+                logger.info(f"   ✅ All fields complete after {tag}")
                 break
 
         if not source_tags:
-            # Heuristic "still valid but low confidence"
-            res = ValidationResult(is_valid=True, confidence=0.5, source="heuristic", filled_fields={})
-            self._cache_put(flight_no, date, res)
-            return res
+            res = ValidationResult(
+                is_valid=True,
+                confidence=0.5,
+                source="heuristic",
+                filled_fields={},
+                warnings=["No API data found"]
+            )
+            self._cache_put(flight_no, date, flight, res)
+            return [res]  # 🔥 Return as list
 
         res = ValidationResult(
             is_valid=True,
             confidence=conf if conf > 0 else 0.5,
             source="+".join(source_tags),
             filled_fields=filled,
+            warnings=warnings,
         )
-        self._cache_put(flight_no, date, res)
-        return res
+        self._cache_put(flight_no, date, flight, res)
+        return [res]  # 🔥 Return as list
 
     def _apply_aviedge_fields(self, api_data: Dict[str, Any], flight: Dict[str, Any], filled: Dict[str, Any]) -> None:
         """
@@ -1001,14 +1441,42 @@ class FastFlightValidator:
         sched_out = api_data.get("scheduled_out")
         sched_in = api_data.get("scheduled_in")
         
-        if sched_out and not flight.get("sched_out_local"):
-            # Aviation Edge times are ISO strings
-            filled["sched_out_local"] = _to_local_hhmm_from_iso(sched_out, origin or flight.get("origin"))
+        # 🔥 CONVERT API TIMES FIRST
+        api_out_local = None
+        api_in_local = None
         
-        if sched_in and not flight.get("sched_in_local"):
-            filled["sched_in_local"] = _to_local_hhmm_from_iso(sched_in, dest or flight.get("dest"))
+        if sched_out:
+            api_out_local = _to_local_hhmm_from_iso(sched_out, origin or flight.get("origin"))
+        if sched_in:
+            api_in_local = _to_local_hhmm_from_iso(sched_in, dest or flight.get("dest"))
+        
+        # 🔥 VALIDATE: If user provided departure time, API must match within 30 minutes
+        user_time = flight.get("sched_out_local")
+        if user_time and api_out_local:
+            try:
+                user_minutes = int(user_time[:2]) * 60 + int(user_time[2:])
+                api_minutes = int(api_out_local[:2]) * 60 + int(api_out_local[2:])
+                time_diff = abs(api_minutes - user_minutes)
+                
+                if time_diff > 30:  # More than 30 minutes difference
+                    logger.warning(f"   ⚠️  Time mismatch: user={user_time} api={api_out_local} (diff={time_diff}min) - REJECTING")
+                    # Don't use this flight data at all
+                    return
+                else:
+                    logger.info(f"   ✅ Time validated: user={user_time} api={api_out_local} (diff={time_diff}min)")
+            except Exception as e:
+                logger.warning(f"   ⚠️  Time validation error: {e}")
+        
+        # 🔥 ONLY FILL IF VALIDATION PASSED
+        if api_out_local and not flight.get("sched_out_local"):
+            filled["sched_out_local"] = api_out_local
+        
+        if api_in_local and not flight.get("sched_in_local"):
+            filled["sched_in_local"] = api_in_local
 
-    def _apply_aero_fields(self, api_data: Dict[str, Any], flight: Dict[str, Any], filled: Dict[str, Any]) -> None:
+    def _apply_aero_fields(
+        self, api_data: Dict[str, Any], flight: Dict[str, Any], filled: Dict[str, Any], warnings: List[str]
+    ) -> None:
         """
         Extract origin/dest + scheduled times from AeroAPI record.
         Works with both /flights and /schedules shapes.
@@ -1038,13 +1506,11 @@ class FastFlightValidator:
         if dest and not flight.get("dest"):
             filled["dest"] = dest
 
-        # Times
-        # Possible keys (strings, ISO 8601): scheduled_out, scheduled_in, scheduled_off, scheduled_on
-        # Some schedules carry times under departure/arrival dicts (e.g., {"scheduled": "2025-09-19T12:34:00Z"})
+        # Times - helper to extract ISO timestamps
         def _first_iso(*keys: str) -> Optional[str]:
             for k in keys:
                 v = api_data.get(k)
-                if isinstance(v, str) and ("T" in v or v.endswith("Z")):  # Better ISO check
+                if isinstance(v, str) and ("T" in v or v.endswith("Z")):
                     return v
                 if isinstance(v, dict):
                     sched = v.get("scheduled")
@@ -1052,17 +1518,59 @@ class FastFlightValidator:
                         return sched
             return None
 
-        if not flight.get("sched_out_local"):
-            iso_dep = _first_iso("scheduled_out", "scheduled_off", "departure_time", "departure")
-            if iso_dep:
-                filled["sched_out_local"] = _to_local_hhmm_from_iso(iso_dep, filled.get("origin") or flight.get("origin"))
+        # 🔥 STEP 1: Extract and convert API times
+        iso_dep = _first_iso(
+            "scheduled_out", "scheduled_off", "departure_time", "departure"
+        )
+        iso_arr = _first_iso(
+            "scheduled_in", "scheduled_on", "arrival_time", "arrival"
+        )
+        
+        api_out_local = None
+        api_in_local = None
+        
+        
+        if iso_dep:
+            api_out_local = _to_local_hhmm_from_iso(iso_dep, filled.get("origin") or flight.get("origin"))
+        if iso_arr:
+            api_in_local = _to_local_hhmm_from_iso(iso_arr, filled.get("dest") or flight.get("dest"))
 
-        if not flight.get("sched_in_local"):
-            iso_arr = _first_iso("scheduled_in", "scheduled_on", "arrival_time", "arrival")
-            if iso_arr:
-                filled["sched_in_local"] = _to_local_hhmm_from_iso(iso_arr, filled.get("dest") or flight.get("dest"))
+        # 🔥 SMARTER time validation
+        user_time = flight.get("sched_out_local")
+        if user_time and api_out_local:
+            try:
+                user_minutes = int(user_time[:2]) * 60 + int(user_time[2:])
+                api_minutes = int(api_out_local[:2]) * 60 + int(api_out_local[2:])
+                time_diff = abs(api_minutes - user_minutes)
 
-    def _apply_fr24_fields(self, api_data: Dict[str, Any], flight: Dict[str, Any], filled: Dict[str, Any]) -> None:
+                if time_diff > 120:  # More than 2 hours - definitely wrong flight
+                    logger.warning(
+                        f"   ⚠️  Time mismatch: user={user_time} api={api_out_local} "
+                        f"(diff={time_diff}min) - REJECTING (>2hrs)"
+                    )
+                    filled.clear()
+                    return
+                elif time_diff > 15:  # 15min-2hrs - possibly correct but uncertain
+                    logger.warning(
+                        f"   ⚠️  Time mismatch: user={user_time} api={api_out_local} "
+                        f"(diff={time_diff}min) - UNCERTAIN"
+                    )
+                    warnings.append(f"Departure time differs by {time_diff} minutes from expected")
+                else:
+                    logger.info(
+                        f"   ✅ Time validated: user={user_time} api={api_out_local} (diff={time_diff}min)"
+                    )
+            except Exception as e:
+                logger.warning(f"   ⚠️  Time validation error: {e}")
+
+        # 🔥 STEP 3: Fill times only if validation passed (or no user hint)
+        if api_out_local and not flight.get("sched_out_local"):
+            filled["sched_out_local"] = api_out_local
+
+        if api_in_local and not flight.get("sched_in_local"):
+            filled["sched_in_local"] = api_in_local
+
+    def _apply_fr24_fields(self, api_data: Dict[str, Any], flight: Dict[str, Any], filled: Dict[str, Any], warnings: List[str]) -> None:
         """
         Extract fields from FR24 record.
         """
@@ -1082,65 +1590,96 @@ class FastFlightValidator:
         dep_epoch = times.get("departure")
         arr_epoch = times.get("arrival")
 
-        if not flight.get("sched_out_local"):
-            # Convert from epoch(UTC) → local HHMM using origin tz
-            hhmm = _to_local_hhmm_from_epoch_utc(dep_epoch, filled.get("origin") or flight.get("origin"))
-            if hhmm:
-                filled["sched_out_local"] = hhmm
+        # 🔥 STEP 1: Convert FR24 epoch times to local HHMM
+        api_out_local = None
+        api_in_local = None
+        
+        if dep_epoch:
+            api_out_local = _to_local_hhmm_from_epoch_utc(
+                dep_epoch, filled.get("origin") or flight.get("origin")
+            )
+        if arr_epoch:
+            api_in_local = _to_local_hhmm_from_epoch_utc(
+                arr_epoch, filled.get("dest") or flight.get("dest")
+            )
 
-        if not flight.get("sched_in_local"):
-            hhmm = _to_local_hhmm_from_epoch_utc(arr_epoch, filled.get("dest") or flight.get("dest"))
-            if hhmm:
-                filled["sched_in_local"] = hhmm
+        # 🔥 SMARTER time validation (same logic as aero)
+        user_time = flight.get("sched_out_local")
+        if user_time and api_out_local:
+            try:
+                user_minutes = int(user_time[:2]) * 60 + int(user_time[2:])
+                api_minutes = int(api_out_local[:2]) * 60 + int(api_out_local[2:])
+                time_diff = abs(api_minutes - user_minutes)
 
+                if time_diff > 120:
+                    logger.warning(
+                        f"   ⚠️  FR24 time mismatch: user={user_time} api={api_out_local} "
+                        f"(diff={time_diff}min) - REJECTING (>2hrs)"
+                    )
+                    filled.clear()
+                    return
+                elif time_diff > 15:
+                    logger.warning(
+                        f"   ⚠️  FR24 time mismatch: user={user_time} api={api_out_local} "
+                        f"(diff={time_diff}min) - UNCERTAIN"
+                    )
+                    warnings.append(f"Departure time differs by {time_diff} minutes from expected")
+                else:
+                    logger.info(
+                        f"   ✅ FR24 time validated: user={user_time} api={api_out_local} (diff={time_diff}min)"
+                    )
+            except Exception as e:
+                logger.warning(f"   ⚠️  FR24 time validation error: {e}")
+
+        # 🔥 STEP 3: Fill times only if validation passed
+        if api_out_local and not flight.get("sched_out_local"):
+            filled["sched_out_local"] = api_out_local
+
+        if api_in_local and not flight.get("sched_in_local"):
+            filled["sched_in_local"] = api_in_local
+        
     async def validate_batch(self, flights: List[Dict[str, Any]]) -> Dict[str, Any]:
         start = time.time()
         need = []
         prefilled = []
+        
         for f in flights:
             if all(f.get(k) for k in ("origin", "dest", "sched_out_local", "sched_in_local")):
-                prefilled.append(ValidationResult(is_valid=True, confidence=1.0, source="complete"))
+                prefilled.append([ValidationResult(is_valid=True, confidence=1.0, source="complete")])
             else:
                 need.append(f)
 
         logger.info("🚀 BATCH VALIDATION STARTED")
-        logger.info(f"   Total flights: {len(flights)} | Need validation: {len(need)} | Already complete: {len(prefilled)}")
+        logger.info(f"   Total flights: {len(flights)} | Need validation: {len(need)}")
 
-        validations: List[ValidationResult] = []
+        validations: List[List[ValidationResult]] = []  # 🔥 Now list of lists
+        
         if need:
-            # Sequential processing with delay between requests
             for i, f in enumerate(need):
                 try:
-                    # Add delay after every 3rd request to avoid rate limiting
                     if i > 0 and i % 3 == 0:
-                        await asyncio.sleep(1.0)  # 1 second delay every 3 requests
+                        await asyncio.sleep(1.0)
                         
-                    result = await self._validate_one(f)
-                    validations.append(result)
+                    results = await self._validate_one(f)  # 🔥 Returns list now
+                    validations.append(results)
                 except Exception as e:
                     logger.error(f"Validation exception: {e}")
-                    validations.append(ValidationResult(
-                        is_valid=False, 
-                        confidence=0.0, 
-                        source="error", 
+                    validations.append([ValidationResult(
+                        is_valid=False,
+                        confidence=0.0,
+                        source="error",
                         warnings=[str(e)]
-                    ))
+                    )])
 
-        # Interleave back into original order
-        all_results: List[ValidationResult] = []
-        it = iter(validations)
-        for f in flights:
-            if all(f.get(k) for k in ("origin", "dest", "sched_out_local", "sched_in_local")):
-                all_results.append(prefilled.pop(0))
-            else:
-                all_results.append(next(it))
-
+        # 🔥 Flatten: Create one EnrichedFlight per ValidationResult
         enriched: List[EnrichedFlight] = []
-        for raw, val in zip(flights, all_results):
-            ef = EnrichedFlight(**raw, validation_result=val)
-            for k, v in (val.filled_fields or {}).items():
-                setattr(ef, k, v)
-            enriched.append(ef)
+        
+        for raw, val_list in zip(flights, validations if validations else prefilled):
+            for val in val_list:  # 🔥 Loop through all results for this flight
+                ef = EnrichedFlight(**raw, validation_result=val)
+                for k, v in (val.filled_fields or {}).items():
+                    setattr(ef, k, v)
+                enriched.append(ef)
 
         valid_count = sum(1 for e in enriched if e.validation_result and e.validation_result.is_valid)
         avg_conf = (
@@ -1151,25 +1690,30 @@ class FastFlightValidator:
         elapsed = time.time() - start
 
         logger.info("✅ BATCH VALIDATION COMPLETE")
-        logger.info(f"   Valid flights: {valid_count}/{len(flights)} | Avg conf: {avg_conf:.2f} | Fields filled: {total_filled} | {elapsed:.2f}s")
+        logger.info(f"   Enriched flights: {len(enriched)} from {len(flights)} input | {elapsed:.2f}s")
 
         return {
             "enriched_flights": [e.dict() for e in enriched],
             "validation_summary": {
-                "total_flights": len(flights),
+                "total_input_flights": len(flights),
+                "total_output_flights": len(enriched),
                 "valid_flights": valid_count,
                 "average_confidence": avg_conf,
                 "total_fields_filled": total_filled,
                 "processing_time_seconds": elapsed,
                 "sources_used": sorted(set((e.validation_result.source if e.validation_result else "none") for e in enriched)),
-                "warnings": [],
             },
         }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC ENTRYPOINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def validate_extraction_results(extraction_result: Dict[str, Any]) -> Dict[str, Any]:
+
+async def validate_extraction_results(
+    extraction_result: Dict[str, Any]
+) -> Dict[str, Any]:
     """
     Accepts your extractor output and returns the same dict updated with:
       - "validation": {...}
@@ -1192,4 +1736,11 @@ async def validate_extraction_results(extraction_result: Dict[str, Any]) -> Dict
     return extraction_result
 
 
-__all__ = ["validate_extraction_results", "FastFlightValidator", "AeroAPIClient", "FR24Client", "ValidationResult", "EnrichedFlight"]
+__all__ = [
+    "validate_extraction_results",
+    "FastFlightValidator",
+    "AeroAPIClient",
+    "FR24Client",
+    "ValidationResult",
+    "EnrichedFlight",
+]
