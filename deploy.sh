@@ -1,44 +1,49 @@
 #!/bin/bash
-set -e # Exit immediately if a command fails
+set -euo pipefail
 
-# --- Your Server IP ---
 IP="64.23.178.61"
 
 echo "🚀 Deploying to $IP..."
 
-# This is the 'heredoc'. It sends all the commands between
-# <<'REMOTE' and REMOTE to the server to be executed.
-ssh root@$IP 'bash -s' <<'REMOTE'
-set -e
+ssh root@"$IP" 'bash -s' <<'REMOTE'
+set -euo pipefail
 
 echo "➡️  (On Server) Starting deployment steps..."
 
 PROJECT_DIR="/opt/flightintel"
+SERVER_CODE_DIR="$PROJECT_DIR/server"
+VENV="$PROJECT_DIR/venv"
+PYTHON="$VENV/bin/python"
+PIP="$VENV/bin/pip"
+REQUIREMENTS="$SERVER_CODE_DIR/requirements.txt"
 
-# 1. Go to project directory and PULL THE LATEST CODE
+# Log directory for Loki/Promtail
+LOG_DIR="/var/log/flightintel"
+
 cd "$PROJECT_DIR"
 echo "🔄  Updating repository from GitHub..."
 git fetch origin
 git reset --hard origin/main
 
-# 2. Define Paths and Environment
-VENV="$PROJECT_DIR/venv"
-PIP="$VENV/bin/pip"
-PYTHON="$VENV/bin/python"
-REQUIREMENTS="$PROJECT_DIR/server/requirements.txt"
-SERVER_CODE_DIR="$PROJECT_DIR/server"
-source "$HOME/.cargo/env"
+# Ensure virtualenv
+if [ ! -x "$PYTHON" ]; then
+  echo "🐍  Creating virtualenv..."
+  python3 -m venv "$VENV"
+  "$PIP" install -U pip wheel setuptools
+fi
 
-# 3. Install Dependencies
 echo "📦  Installing dependencies..."
 "$PIP" install -r "$REQUIREMENTS"
 
-# 4. Restart the Application
+# Ensure log directory (file will be created by logging_utils)
+echo "🧾  Ensuring log directory exists at $LOG_DIR..."
+mkdir -p "$LOG_DIR"
+chmod 755 "$LOG_DIR"
+
 echo "🔄  Restarting the application service..."
 tmux kill-session -t flightintel 2>/dev/null || true
 tmux new -d -s flightintel "cd $SERVER_CODE_DIR && exec $PYTHON -m uvicorn main:app --host 0.0.0.0 --port 8000"
 
-# 5. Final Check
 echo "✅  (On Server) Deployment complete!"
 REMOTE
 

@@ -17,12 +17,31 @@ SERVICE_NAME = os.getenv("SERVICE_NAME", "flightintel")
 ENV = os.getenv("APP_ENV", "dev")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# Default log file path for Loki/Promtail
+LOG_FILE = os.getenv("LOG_FILE", "/var/log/flightintel/app.log")
+
 # Built-in LogRecord fields that must never be overwritten
 _RESERVED_LOG_FIELDS = {
-    "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
-    "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
-    "created", "msecs", "relativeCreated", "thread", "threadName",
-    "processName", "process"
+    "name",
+    "msg",
+    "args",
+    "levelname",
+    "levelno",
+    "pathname",
+    "filename",
+    "module",
+    "exc_info",
+    "exc_text",
+    "stack_info",
+    "lineno",
+    "funcName",
+    "created",
+    "msecs",
+    "relativeCreated",
+    "thread",
+    "threadName",
+    "processName",
+    "process",
 }
 
 
@@ -30,7 +49,7 @@ class LokiJSONFormatter(logging.Formatter):
     """
     Format log records as single-line JSON for Loki ingestion.
 
-    Each log line produces:
+    Each log line looks like:
         {
             "ts": "...",
             "level": "INFO",
@@ -58,8 +77,7 @@ class LokiJSONFormatter(logging.Formatter):
         if rid:
             payload["request_id"] = rid
 
-        # Standard LogRecord keys we will *not* echo as structured fields
-        standard_keys = _reserved_keys = _RESERVED_LOG_FIELDS
+        standard_keys = _RESERVED_LOG_FIELDS
 
         # Merge user structured data safely
         for key, value in record.__dict__.items():
@@ -78,7 +96,7 @@ class LokiJSONFormatter(logging.Formatter):
 def configure_logging() -> None:
     """
     Configure root logging once for the whole process.
-    Output = pure JSON → Loki-ready.
+    Output -> JSON to both stdout and /var/log/flightintel/app.log.
     """
     root = logging.getLogger()
 
@@ -88,11 +106,25 @@ def configure_logging() -> None:
 
     root.setLevel(LOG_LEVEL)
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(LokiJSONFormatter())
+    formatter = LokiJSONFormatter()
 
-    root.handlers.clear()
-    root.addHandler(handler)
+    # 1) STDOUT (uvicorn/console)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    root.addHandler(stream_handler)
+
+    # 2) FILE for Promtail/Loki
+    try:
+        log_dir = os.path.dirname(LOG_FILE)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+        file_handler = logging.FileHandler(LOG_FILE)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    except Exception as e:
+        # If file logging fails, keep stdout logging only
+        root.error(f"Failed to set up file logging: {e}")
 
     root._loki_configured = True  # type: ignore[attr-defined]
 
@@ -122,7 +154,7 @@ def log_event(
         module   → field_module
         etc.
     """
-    safe_fields = {}
+    safe_fields: Dict[str, Any] = {}
 
     for key, value in fields.items():
         if key in _RESERVED_LOG_FIELDS:
