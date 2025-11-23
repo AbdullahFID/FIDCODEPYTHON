@@ -13,10 +13,13 @@ from fastapi.responses import JSONResponse
 from PIL import Image
 from pydantic import BaseModel
 from starlette.status import HTTP_400_BAD_REQUEST
+import cv2
+import numpy as np
 
 from openai import AsyncOpenAI
 
 from flight_intel_patch.validator import validate_extraction_results
+from pdf_processor import PDFProcessor  # 🔥 IMPORT PDF PROCESSOR
 from logging_utils import configure_logging, new_request_id, log_event
 
 # ------------------------------------------------------------------------------
@@ -161,6 +164,33 @@ def _analyse_image_quality(image_bytes: bytes) -> Dict[str, Any]:
         }
 
 
+# 🔥 NEW: DETECT IF FILE IS PDF
+def _is_pdf(file_bytes: bytes, content_type: Optional[str]) -> bool:
+    """
+    Check if file is PDF via MIME type or magic bytes.
+    """
+    # Check MIME type
+    if content_type and "pdf" in content_type.lower():
+        return True
+    
+    # Check magic bytes (PDF starts with %PDF)
+    if file_bytes[:4] == b'%PDF':
+        return True
+    
+    return False
+
+
+# 🔥 NEW: CONVERT CV2 IMAGE TO BYTES
+def _cv2_to_bytes(cv_img: np.ndarray) -> bytes:
+    """
+    Convert OpenCV image (np.ndarray) to bytes for downstream processing.
+    """
+    success, buffer = cv2.imencode('.png', cv_img)
+    if not success:
+        raise ValueError("Failed to encode image to PNG")
+    return buffer.tobytes()
+
+
 # ------------------------------------------------------------------------------
 # OPENAI VISION (CORRECTED + STRONG CONSTRAINTS)
 # ------------------------------------------------------------------------------
@@ -168,6 +198,7 @@ def _analyse_image_quality(image_bytes: bytes) -> Dict[str, Any]:
 async def _openai_extract_flights(
     image_bytes: bytes,
     airline: Optional[str],
+    page_num: int = 1,
 ) -> Dict[str, Any]:
 
     import json
@@ -191,7 +222,7 @@ async def _openai_extract_flights(
         '      \"dest\": \"LAX\" or null,\n'
         '      \"sched_out_local\": \"HHMM\" or null,\n'
         '      \"sched_in_local\": \"HHMM\" or null,\n'
-        '      \"page_number\": 1,\n'
+        f'      \"page_number\": {page_num},\n'
         '      \"confidence\": 0.0\n'
         "    }\n"
         "  ],\n"
@@ -209,7 +240,7 @@ async def _openai_extract_flights(
             "If there is ambiguity, prefer flights from this airline."
         )
 
-    log_event(logger, "openai_call_started", model=MODEL_NAME)
+    log_event(logger, "openai_call_started", model=MODEL_NAME, page=page_num)
 
     try:
         resp = await client.chat.completions.create(
@@ -242,7 +273,7 @@ async def _openai_extract_flights(
             ],
         )
     except Exception as e:
-        log_event(logger, "openai_call_error", level=logging.ERROR, error=str(e))
+        log_event(logger, "openai_call_error", level=logging.ERROR, error=str(e), page=page_num)
         raise HTTPException(status_code=500, detail=str(e))
 
     elapsed = time.time() - t0
@@ -267,6 +298,7 @@ async def _openai_extract_flights(
         logger,
         "openai_call_finished",
         model=MODEL_NAME,
+        page=page_num,
         duration_ms=int(elapsed * 1000),
         tokens_total=total_tokens,
         tokens_in=input_tokens,
@@ -276,7 +308,7 @@ async def _openai_extract_flights(
     try:
         data = json.loads(text)
     except Exception:
-        log_event(logger, "openai_parse_error", level=logging.ERROR, raw_output=text)
+        log_event(logger, "openai_parse_error", level=logging.ERROR, raw_output=text, page=page_num)
         raise HTTPException(400, "Model did not return valid JSON")
 
     flights = data.get("flights") or []
@@ -314,7 +346,7 @@ async def extract(
     x_airline: Optional[str] = Header(None, alias="X-Airline"),
 ):
     """
-    Main API pipeline
+    Main API pipeline - now supports both images AND PDFs! 🎉
     """
     overall_start = time.time()
 
@@ -338,20 +370,105 @@ async def extract(
     if not file_bytes:
         raise HTTPException(400, "Empty file")
 
-    img_stats = _analyse_image_quality(file_bytes)
-    log_event(logger, "image_analysis", **img_stats)
+    # 🔥 PDF DETECTION AND CONVERSION
+    is_pdf_file = _is_pdf(file_bytes, file.content_type)
+    
+    if is_pdf_file:
+        log_event(logger, "pdf_detected", filename=file.filename)
+        
+        # Convert PDF to list of cv2 images
+        try:
+            cv_images = await PDFProcessor.convert(file_bytes)
+            log_event(logger, "pdf_converted", pages=len(cv_images))
+        except Exception as e:
+            log_event(logger, "pdf_conversion_failed", level=logging.ERROR, error=str(e))
+            raise HTTPException(422, f"PDF conversion failed: {str(e)}")
+        
+        # Process each page
+        all_flights: List[Dict[str, Any]] = []
+        all_connections: List[Dict[str, Any]] = []
+        total_usage = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+        page_times: Dict[str, float] = {}
+        
+        for page_idx, cv_img in enumerate(cv_images, start=1):
+            page_t0 = time.time()
+            log_event(logger, "page_processing_started", page_number=page_idx)
+            
+            # Convert cv2 image back to bytes for processing
+            page_bytes = _cv2_to_bytes(cv_img)
+            
+            # Run image quality analysis on first page only (for metadata)
+            if page_idx == 1:
+                img_stats = _analyse_image_quality(page_bytes)
+                log_event(logger, "image_analysis", page=page_idx, **img_stats)
+            
+            # Extract flights from this page
+            extraction_raw = await _openai_extract_flights(page_bytes, airline_code, page_idx)
+            
+            page_elapsed = time.time() - page_t0
+            page_times[f"page_{page_idx}_total"] = page_elapsed
+            
+            # Accumulate flights
+            for flight in extraction_raw["flights"]:
+                flight["page_number"] = page_idx  # Tag with page number
+                all_flights.append(flight)
+            
+            all_connections.extend(extraction_raw["connections"])
+            
+            # Accumulate token usage
+            for key in ["total_tokens", "input_tokens", "output_tokens"]:
+                total_usage[key] += extraction_raw["usage"].get(key, 0)
+            
+            log_event(
+                logger,
+                "page_processing_finished",
+                page_number=page_idx,
+                duration_ms=int(page_elapsed * 1000),
+                flights_found=len(extraction_raw["flights"]),
+            )
+        
+        # Use accumulated results
+        flights_raw = all_flights
+        connections = all_connections
+        usage = total_usage
+        processing_time = page_times
+        processing_time["total_request"] = time.time() - overall_start
+        total_pages = len(cv_images)
+        
+    else:
+        # 🔥 STANDARD IMAGE PROCESSING (original flow)
+        log_event(logger, "image_detected", filename=file.filename)
+        
+        img_stats = _analyse_image_quality(file_bytes)
+        log_event(logger, "image_analysis", **img_stats)
 
-    # Step 2: extraction via OpenAI
-    page_t0 = time.time()
-    log_event(logger, "page_processing_started", page_number=1)
+        # Step 2: extraction via OpenAI
+        page_t0 = time.time()
+        log_event(logger, "page_processing_started", page_number=1)
 
-    extraction_raw = await _openai_extract_flights(file_bytes, airline_code)
+        extraction_raw = await _openai_extract_flights(file_bytes, airline_code, page_num=1)
 
-    page_elapsed = time.time() - page_t0
+        page_elapsed = time.time() - page_t0
 
-    # Raw flights straight from model
-    flights_raw: List[Dict[str, Any]] = extraction_raw["flights"]
+        flights_raw = extraction_raw["flights"]
+        connections = extraction_raw["connections"]
+        usage = extraction_raw["usage"]
+        processing_time = {
+            "total_request": time.time() - overall_start,
+            "page_1_total": page_elapsed,
+        }
+        total_pages = 1
+        
+        log_event(
+            logger,
+            "page_processing_finished",
+            page_number=1,
+            duration_ms=int(page_elapsed * 1000),
+            flights_found=len(flights_raw),
+        )
 
+    # 🔥 COMMON PROCESSING (same for images and PDFs)
+    
     # Filter out any flights with missing/blank flight_no BEFORE validation
     cleaned_flights: List[Dict[str, Any]] = []
     dropped_missing_flight_no = 0
@@ -378,16 +495,7 @@ async def extract(
             dropped_missing_flight_no=dropped_missing_flight_no,
         )
 
-    log_event(
-        logger,
-        "page_processing_finished",
-        page_number=1,
-        duration_ms=int(page_elapsed * 1000),
-        flights_found=len(cleaned_flights),
-    )
-
     flights: List[Dict[str, Any]] = cleaned_flights
-    connections: List[Dict[str, Any]] = extraction_raw["connections"]
     total_flights = len(flights)
     avg_conf = (
         sum(float(f.get("confidence") or 1.0) for f in flights) / total_flights
@@ -417,18 +525,15 @@ async def extract(
         "connections": connections,
         "total_flights_found": len(complete_flights),  # 🔥 Count only complete
         "avg_conf": avg_conf,  # 🔥 Changed from avg_confidence
-        "processing_time": {
-            "total_request": time.time() - overall_start,
-            "page_1_total": page_elapsed,
-        },
-        "extraction_method": "direct",
+        "processing_time": processing_time,
+        "extraction_method": "pdf" if is_pdf_file else "direct",  # 🔥 Track method
         "metadata": {
             "airline": {"iata": airline_code},
             "file": {
                 "name": file.filename,
                 "type": file.content_type,
                 "size": len(file_bytes),
-                "pages": 1,
+                "pages": total_pages,  # 🔥 Accurate page count
             },
         },
     }
@@ -484,8 +589,7 @@ async def extract(
             duration_ms=int((time.time() - validation_start) * 1000),
         )
 
-    # Cost estimation
-    usage = extraction_raw["usage"]
+    # Cost estimation (GPT-5.1 pricing: $2.50/1M input, $10/1M output)
     input_cost = (usage["input_tokens"] / 1_000_000) * 2.50
     output_cost = (usage["output_tokens"] / 1_000_000) * 10.00
     total_cost = input_cost + output_cost
@@ -493,7 +597,7 @@ async def extract(
     extraction_validated["cost_analysis"] = {
         "total_tokens": usage["total_tokens"],
         "total_cost_usd": round(total_cost, 4),
-        "api_calls": 1,
+        "api_calls": total_pages,  # 🔥 One call per page
     }
 
     log_event(
@@ -501,6 +605,8 @@ async def extract(
         "http_request_pipeline_completed",
         filename=file.filename,
         airline=airline_code,
+        is_pdf=is_pdf_file,
+        pages=total_pages,
         flights_found=extraction_validated.get("total_flights_found", 0),
         duration_ms=int((time.time() - overall_start) * 1000),
     )
