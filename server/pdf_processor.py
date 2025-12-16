@@ -7,7 +7,8 @@ from fastapi import HTTPException
 from pdf2image import convert_from_bytes
 
 from config import MAX_WORKERS, thread_pool
-from logging_utils import logger
+from logging_utils import get_logger
+logger = get_logger("pdf_processor")
 import functools as _functools
 import asyncio
 

@@ -12,9 +12,11 @@ FR24_BASE_URL = "https://api.flightradar24.com/common/v1"
 AVIATION_EDGE_BASE = "https://aviation-edge.com/v2/public"
 
 # API keys
-FLIGHTAWARE_API_KEY: str | None = os.getenv("FLIGHTAWARE_API_KEY")
-FLIGHTRADAR24_API_KEY: str | None = os.getenv("FLIGHTRADAR24_API_KEY")
-AVIATION_EDGE_API_KEY: str | None = os.getenv("AVIATION_EDGE_KEY")
+from typing import Optional
+
+FLIGHTAWARE_API_KEY: Optional[str] = os.getenv("FLIGHTAWARE_API_KEY")
+FLIGHTRADAR24_API_KEY: Optional[str] = os.getenv("FLIGHTRADAR24_API_KEY")
+AVIATION_EDGE_API_KEY: Optional[str] = os.getenv("AVIATION_EDGE_KEY")
 
 # Rate limiting / concurrency knobs
 AEROAPI_MAX_RPS: float = float(os.getenv("AEROAPI_MAX_RPS", "10"))

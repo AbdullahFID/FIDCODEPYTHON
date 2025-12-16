@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import BadRequestError  # optional if you want more granular handling
 
 from config import client, MODEL, MAX_TOKENS, OPENAI_TIMEOUT
-from logging_utils import logger
+from logging_utils import get_logger
+logger = get_logger("extraction_engine")
 from models import Flight
 from patterns import patterns
 from prompts import (

@@ -7,7 +7,8 @@ import numpy as np
 from connections import ConnectionDetector
 from extraction_engine import PerfectExtractionEngine
 from image_processing import UltimateImageProcessor
-from logging_utils import logger
+from logging_utils import get_logger
+logger = get_logger("pipeline")
 from models import Flight, Result
 
 

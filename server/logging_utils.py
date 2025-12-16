@@ -6,12 +6,13 @@ import logging
 import os
 import sys
 import uuid
+import time
 from datetime import datetime
+from typing import Any, Dict, Optional
 from contextvars import ContextVar
-from typing import Any, Dict
 
 # Per-request correlation id (attached via middleware in api.py)
-_request_id: ContextVar[str | None] = ContextVar("request_id", default=None)
+_request_id: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "flightintel")
 ENV = os.getenv("APP_ENV", "dev")
@@ -135,7 +136,7 @@ def new_request_id() -> str:
     return rid
 
 
-def set_request_id(rid: str | None) -> None:
+def set_request_id(rid: Optional[str]) -> None:
     _request_id.set(rid)
 
 
@@ -163,3 +164,39 @@ def log_event(
             safe_fields[key] = value
 
     logger.log(level, event, extra={"event": event, **safe_fields})
+
+
+class FlightIntelLogger:
+    def __init__(self, name: str):
+        self.logger = logging.getLogger(name)
+        self.timers: Dict[str, float] = {}
+
+    def info(self, msg, *args, **kwargs):
+        self.logger.info(msg, *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        self.logger.error(msg, *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        self.logger.warning(msg, *args, **kwargs)
+
+    def start_timer(self, name: str):
+        rid = _request_id.get() or "global"
+        key = f"{rid}:{name}"
+        self.timers[key] = time.time()
+
+    def end_timer(self, name: str) -> float:
+        rid = _request_id.get() or "global"
+        key = f"{rid}:{name}"
+        start = self.timers.pop(key, None)
+        if start:
+            elapsed = time.time() - start
+            return elapsed
+        return 0.0
+
+    def log_extraction(self, count, attempt, method):
+        self.logger.info(f"Extraction: {count} flights, attempt {attempt}, method {method}")
+
+
+def get_logger(name: str) -> FlightIntelLogger:
+    return FlightIntelLogger(name)

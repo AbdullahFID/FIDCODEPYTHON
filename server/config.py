@@ -3,7 +3,11 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from openai import AsyncOpenAI
 
-from logging_utils import logger
+import logging
+from logging_utils import configure_logging
+
+configure_logging()
+logger = logging.getLogger("flightintel.config")
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_KEY:
@@ -18,6 +22,6 @@ thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 client = AsyncOpenAI(api_key=OPENAI_KEY)
 
-logger.logger.info(
+logger.info(
     f"Config: model={MODEL}, timeout={OPENAI_TIMEOUT}s, workers={MAX_WORKERS}"
 )

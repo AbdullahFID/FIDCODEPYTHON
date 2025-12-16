@@ -9,7 +9,8 @@ same-day legs at the same airport within a configurable connection window.
 from collections import defaultdict
 from typing import Dict, List
 
-from logging_utils import logger
+from logging_utils import get_logger
+logger = get_logger("connections")
 from models import Flight
 
 

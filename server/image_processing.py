@@ -4,7 +4,8 @@ from typing import Any, Dict, List, Tuple
 import cv2
 import numpy as np
 
-from logging_utils import logger
+from logging_utils import get_logger
+logger = get_logger("image_processing")
 
 
 class UltimateImageProcessor:
