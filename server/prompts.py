@@ -1,13 +1,3 @@
-from datetime import datetime
-
-# 1. Get today's date in a clear, human-readable format
-current_date_str = datetime.now().strftime("%B %d, %Y")
-
-# 2. Inject this date into your prompt dynamically
-# This finds the placeholder "{current_date}" in your prompt and swaps it
-# for the actual date (e.g., "December 16, 2025")
-final_tier3_prompt = TIER3_FORENSIC_PROMPT.replace("{current_date}", current_date_str)
-
 TIER1_STRUCTURED_PROMPT = """You are an expert at extracting flight schedule data from airline rosters.
 
 EXTRACT ALL FLIGHTS from this image following these rules:
@@ -612,3 +602,18 @@ EXTRACTION RULES:
 - "12 MCO" with flight 9013 = Extract as flight_no="9013", date="09/12/2025", origin="MCO", dest=null
 - "19 MIA TPA" with flight 8619 = Extract as flight_no="8619", date="09/19/2025", origin="MIA", dest="TPA"
 GO FORTH AND EXTRACT EVERYTHING! 🎯"""
+
+
+from datetime import datetime
+
+# 1. Get today's date in a clear, human-readable format
+current_date_str = datetime.now().strftime("%B %d, %Y")
+
+# OVERWRITE the variable with the processed string.
+# This injects the date but keeps the variable name identical.
+TIER3_FORENSIC_PROMPT = TIER3_FORENSIC_PROMPT.replace("{current_date}", current_date_str)
+
+# OPTIONAL: Apply to T1 and T2 as well so they are "Year Aware"
+# (Appending to the end is safe for these prompts)
+TIER1_STRUCTURED_PROMPT += f"\n\nCONTEXT: Today is {current_date_str}. If dates cross Jan 1, increment year."
+TIER2_AGGRESSIVE_PROMPT += f"\n\nCONTEXT: Today is {current_date_str}. If dates cross Jan 1, increment year."
