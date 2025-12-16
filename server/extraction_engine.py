@@ -11,7 +11,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import BadRequestError  # optional if you want more granular handling
 
 from config import client, MODEL, MAX_TOKENS, OPENAI_TIMEOUT
-from logging_utils import logger
+import logging
+logger = logging.getLogger(__name__)
+
 from models import Flight
 from patterns import patterns
 from prompts import (
@@ -255,7 +257,7 @@ CRITICAL: If you see a calendar grid with:
             output_cost = output_tokens * 0.01 / 1000   # $10 / 1M
             total_cost = input_cost + output_cost
 
-            logger.logger.info(
+            logger.info(
                 f"Token usage: in={input_tokens}, out={output_tokens}, total={total_tokens}, "
                 f"cost=${total_cost:.4f}"
             )
@@ -297,7 +299,7 @@ CRITICAL: If you see a calendar grid with:
         ]
 
         messages = self._create_messages(b64_image, prompt, attempt)
-        logger.logger.info(f"OpenAI call (attempt={attempt}, model={MODEL})")
+        logger.info(f"OpenAI call (attempt={attempt}, model={MODEL})")
 
         try:
             response = await asyncio.wait_for(
@@ -402,7 +404,7 @@ Return ONLY this JSON structure:
             if stop_on_first_success and all_flights:
                 return all_flights
 
-            logger.logger.info(f"Processing image version type={vtype}")
+            logger.info(f"Processing image version type={vtype}")
             if vtype == "original":
                 prompts = [TIER1_STRUCTURED_PROMPT, TIER2_AGGRESSIVE_PROMPT]
             elif vtype == "enhanced":
@@ -441,7 +443,7 @@ Return ONLY this JSON structure:
         if not all_flights and image_versions:
             try:
                 original_model = MODEL
-                logger.logger.info("Escalating to GPT-5.1-thinking for rescue attempt")
+                logger.info("Escalating to GPT-5.1-thinking for rescue attempt")
                 # You could swap model via env or config here; for now we just reuse MODEL
                 flights = await self.extract_with_tools(
                     image_versions[0][0],

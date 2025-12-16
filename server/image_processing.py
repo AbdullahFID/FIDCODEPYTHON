@@ -4,7 +4,9 @@ from typing import Any, Dict, List, Tuple
 import cv2
 import numpy as np
 
-from logging_utils import logger
+import logging
+logger = logging.getLogger(__name__)
+
 
 
 class UltimateImageProcessor:
@@ -32,7 +34,7 @@ class UltimateImageProcessor:
             "is_very_blurry": lap_var < 50,
             "is_low_contrast": contrast < 25,
         }
-        logger.logger.info(
+        logger.info(
             f"Image analysis: sharp={info['sharpness']:.1f}, "
             f"contrast={info['contrast']:.1f}, grid={info['has_grid']}, "
             f"text_regions={info['text_regions']}"

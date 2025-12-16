@@ -9,7 +9,9 @@ same-day legs at the same airport within a configurable connection window.
 from collections import defaultdict
 from typing import Dict, List
 
-from logging_utils import logger
+import logging
+logger = logging.getLogger(__name__)
+
 from models import Flight
 
 
@@ -87,5 +89,5 @@ class ConnectionDetector:
                         # Ignore parsing errors and keep scanning
                         continue
 
-        logger.logger.info(f"Detected {len(connections)} connections in schedule")
+        logger.info(f"Detected {len(connections)} connections in schedule")
         return connections

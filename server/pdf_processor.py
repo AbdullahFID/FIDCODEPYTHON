@@ -7,7 +7,9 @@ from fastapi import HTTPException
 from pdf2image import convert_from_bytes
 
 from config import MAX_WORKERS, thread_pool
-from logging_utils import logger
+import logging
+logger = logging.getLogger(__name__)
+
 import functools as _functools
 import asyncio
 
@@ -41,7 +43,7 @@ class PDFProcessor:
                     cv_img = cv2.filter2D(cv_img, -1, kernel)
                 cv_images.append(cv_img)
             logger.end_timer("pdf_conversion")
-            logger.logger.info(f"Converted {len(cv_images)} PDF pages")
+            logger.info(f"Converted {len(cv_images)} PDF pages")
             return cv_images
         except Exception as e:
             logger.end_timer("pdf_conversion")

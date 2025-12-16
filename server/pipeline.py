@@ -7,7 +7,9 @@ import numpy as np
 from connections import ConnectionDetector
 from extraction_engine import PerfectExtractionEngine
 from image_processing import UltimateImageProcessor
-from logging_utils import logger
+import logging
+logger = logging.getLogger(__name__)
+
 from models import Flight, Result
 
 
@@ -54,7 +56,7 @@ class UltimatePipeline:
             all_flights.extend(page_flights)
 
             timing[f"{page_key}_total"] = logger.end_timer(page_key)
-            logger.logger.info(f"Page {page_num}: found {len(page_flights)} flights")
+            logger.info(f"Page {page_num}: found {len(page_flights)} flights")
 
         logger.start_timer("connections")
         connections = self.connector.find_connections(all_flights)
