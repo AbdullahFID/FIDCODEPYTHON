@@ -1,3 +1,13 @@
+from datetime import datetime
+
+# 1. Get today's date in a clear, human-readable format
+current_date_str = datetime.now().strftime("%B %d, %Y")
+
+# 2. Inject this date into your prompt dynamically
+# This finds the placeholder "{current_date}" in your prompt and swaps it
+# for the actual date (e.g., "December 16, 2025")
+final_tier3_prompt = TIER3_FORENSIC_PROMPT.replace("{current_date}", current_date_str)
+
 TIER1_STRUCTURED_PROMPT = """You are an expert at extracting flight schedule data from airline rosters.
 
 EXTRACT ALL FLIGHTS from this image following these rules:
@@ -326,6 +336,28 @@ Pattern examples:
 • Focus: MDW, DAL, DEN, PHX, LAS, BWI
 • Equipment: B737-700/800 only
 • Pattern: High frequency, quick turns
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📅 INTELLIGENT YEAR ROLLOVER LOGIC (CRITICAL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REFERENCE DATE: Today is {current_date}.
+
+You must infer the correct year for every flight based on the Reference Date.
+
+RULES FOR YEAR INFERENCE:
+1. EXPLICIT YEAR: If the image explicitly says "2026", use 2026.
+2. IMPLIED ROLLOVER: If the image contains dates for December AND January:
+   - December dates belong to the CURRENT year (e.g., 2025).
+   - January/February dates belong to the NEXT year (e.g., 2026).
+3. LOGICAL PROGRESSION: Schedules are linear.
+   - If a schedule starts "Dec 30" and the next row is "Jan 02", the Year increments by +1.
+
+EXAMPLES (Assuming Reference Date is Dec 2025):
+- "12/31" → Extract as 12/31/2025
+- "01/01" → Extract as 01/01/2026 (DO NOT use 2025!)
+- "Jan 05" → Extract as 01/05/2026
+
+NEVER create a flight in the past. If today is Dec 2025, a "Jan 05" flight is for Jan 2026, not Jan 2025.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 EXTRACTION REQUIREMENTS
