@@ -158,9 +158,25 @@ CRITICAL: If you see a calendar grid with:
         return out
 
     def _parse_date(self, match) -> str:
+        """
+        Parse date with intelligent year inference for 2026+ dates.
+        
+        ✅ FIXED: Now handles all months in 2026, not just Jan-Feb!
+        
+        Strategy:
+        1. If month < current_month → next year (forward-looking schedules)
+        2. If month >= current_month → current year
+        3. Cap at 18 months forward to prevent far-future errors
+        4. Always respect explicit years
+        """
         txt = match.group(0)
         now = datetime.now()
-        # 24/Aug
+        current_year = now.year
+        current_month = now.month
+        
+        # ════════════════════════════════════════════════════════════
+        # PATTERN 1: DD/Mon format (e.g., "24/Aug")
+        # ════════════════════════════════════════════════════════════
         m = re.match(r"(\d{1,2})/([A-Za-z]{3})", txt)
         if m:
             day = int(m.group(1))
@@ -179,25 +195,53 @@ CRITICAL: If you see a calendar grid with:
                 "nov": 11,
                 "dec": 12,
             }
-            month = month_map.get(mon_str, now.month)
-            year = now.year + (1 if now.month >= 10 and month <= 2 else 0)
+            month = month_map.get(mon_str, current_month)
+            
+            # ✅ FIX: Any past month → next year
+            # Example: Dec 2025 parsing "Sept" → Sept 2026 (not Sept 2025)
+            year = current_year + (1 if month < current_month else 0)
+            
+            # Cap at 18 months forward to prevent far-future misinterpretation
+            months_forward = (year - current_year) * 12 + (month - current_month)
+            if months_forward > 18:
+                year = current_year
+            
             return f"{month:02d}/{day:02d}/{year}"
-        # numeric / numeric
+        
+        # ════════════════════════════════════════════════════════════
+        # PATTERN 2: Numeric format (MM/DD or DD/MM with optional year)
+        # ════════════════════════════════════════════════════════════
         m = re.match(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", txt)
         if m:
             a, b, y = m.group(1), m.group(2), m.group(3)
             a_i, b_i = int(a), int(b)
+            
+            # Handle explicit year if provided
             if y:
                 year = int(y) if len(y) == 4 else 2000 + int(y)
             else:
-                year = now.year
+                year = current_year
+            
+            # Determine MM/DD vs DD/MM format
             if 1 <= a_i <= 12 and 1 <= b_i <= 31:
-                month, day = a_i, b_i
+                month, day = a_i, b_i  # MM/DD format
             else:
-                month, day = b_i, a_i
-            if now.month >= 10 and month <= 2:
-                year = now.year + 1
+                month, day = b_i, a_i  # DD/MM format
+            
+            # ✅ FIX: Any past month → next year (only if year wasn't explicit)
+            if not y:
+                year = current_year + (1 if month < current_month else 0)
+                
+                # Cap at 18 months forward
+                months_forward = (year - current_year) * 12 + (month - current_month)
+                if months_forward > 18:
+                    year = current_year
+            
             return f"{month:02d}/{day:02d}/{year}"
+        
+        # ════════════════════════════════════════════════════════════
+        # FALLBACK: Use current date
+        # ════════════════════════════════════════════════════════════
         return now.strftime("%m/%d/%Y")
 
     # ---------------- OpenAI calls ----------------
