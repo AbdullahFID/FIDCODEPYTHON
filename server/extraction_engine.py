@@ -8,9 +8,11 @@ from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from openai import BadRequestError  # optional if you want more granular handling
+import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from config import client, MODEL, MAX_TOKENS, OPENAI_TIMEOUT
+from config import MODEL, MAX_TOKENS, TIMEOUT
 from logging_utils import get_logger
 logger = get_logger("extraction_engine")
 from models import Flight
@@ -34,7 +36,7 @@ class PerfectExtractionEngine:
 
     # ---------------- core helpers ----------------
 
-    def _create_messages(self, b64_image: str, prompt: str, attempt: int) -> List[dict]:
+    def _create_content(self, b64_image: str, prompt: str, attempt: int) -> List[Any]:
         mobile_hint = """
 CRITICAL: If you see a calendar grid with:
 - Colored bars containing 4-digit numbers (like 9013, 8619)
@@ -45,59 +47,54 @@ CRITICAL: If you see a calendar grid with:
             prompt = mobile_hint + "\n\n" + prompt
         if self.successful_patterns and attempt > 1:
             prompt += f"\n\nPreviously successful patterns: {', '.join(self.successful_patterns[:3])}"
-        return [
-            {
-                "role": "system",
-                "content": (
-                    "You are a flight schedule extraction expert. "
-                    "Always return valid JSON. You are extracting flight schedules from images. "
-                    "Return no metadata, no summaries."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
-                ],
-            },
-        ]
+        
+        # Gemini accepts PIL images or bytes. Since we have b64, we convert back to PIL/Bytes.
+        import base64
+        import io
+        from PIL import Image
+        
+        image_bytes = base64.b64decode(b64_image)
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        system_instruction = (
+            "You are a flight schedule extraction expert. "
+            "Always return valid JSON. You are extracting flight schedules from images. "
+            "Return no metadata, no summaries."
+        )
+        
+        # In Gemini, system instruction is set on the model, but we can prepend it to prompt 
+        # or use the system_instruction argument when creating the model.
+        # For simplicity in this method, we return the parts for the user message.
+        
+        return [prompt, img]
 
     def _parse_response(self, response) -> List[Flight]:
         flights: List[Flight] = []
 
-        # Error JSON (from TIER3 error mode)
-        if getattr(response, "choices", None) and response.choices[0].message.content:
-            content = response.choices[0].message.content
-            try:
-                m = re.search(r'\{[^{}]*"error"\s*:\s*true[^{}]*\}', content, re.DOTALL)
-                if m:
-                    err = json.loads(m.group())
-                    if err.get("error") is True:
-                        self._last_error = err
-                        logger.logger.warning(
-                            f"AI reported extraction error: {err.get('user_message', 'Unknown error')}"
-                        )
-                        return []
-            except Exception:
-                pass
+        # Gemini response structure
+        # response.parts might contain text or function calls
+        
+        try:
+            for part in response.parts:
+                if fn := part.function_call:
+                    if fn.name == "extract_flights":
+                        # Convert MapComposite to dict
+                        args = dict(fn.args)
+                        # args['flights'] might be a list of MapComposite
+                        raw_flights = args.get("flights", [])
+                        for f in raw_flights:
+                            # Convert each flight to dict if it's not already
+                            f_dict = dict(f) if hasattr(f, "items") else f
+                            try:
+                                flights.append(Flight(**f_dict))
+                            except Exception:
+                                continue
+        except Exception:
+            pass
 
-        # Tool calls
-        for choice in getattr(response, "choices", []):
-            tcalls = getattr(choice.message, "tool_calls", None)
-            if tcalls:
-                for tc in tcalls:
-                    if getattr(tc, "function", None) and tc.function.arguments:
-                        try:
-                            data = json.loads(tc.function.arguments)
-                            for f in data.get("flights", []):
-                                flights.append(Flight(**f))
-                        except Exception:
-                            continue
-
-        # Direct JSON in content
-        if not flights and getattr(response, "choices", None):
-            content = response.choices[0].message.content or ""
+        # Direct JSON in text
+        if not flights and response.text:
+            content = response.text
             json_patterns = [
                 r"```json\s*([\s\S]*?)\s*```",
                 r"```\s*([\s\S]*?)\s*```",
@@ -248,12 +245,14 @@ CRITICAL: If you see a calendar grid with:
     # ---------------- OpenAI calls ----------------
 
     async def _record_usage(self, response) -> None:
-        if hasattr(response, "usage") and response.usage:
-            input_tokens = response.usage.prompt_tokens
-            output_tokens = response.usage.completion_tokens
-            total_tokens = response.usage.total_tokens
-            input_cost = input_tokens * 0.0025 / 1000   # $2.50 / 1M
-            output_cost = output_tokens * 0.01 / 1000   # $10 / 1M
+        if hasattr(response, "usage_metadata"):
+            usage = response.usage_metadata
+            input_tokens = usage.prompt_token_count
+            output_tokens = usage.candidates_token_count
+            total_tokens = usage.total_token_count
+            # Gemini Flash pricing approx
+            input_cost = input_tokens * 0.10 / 1_000_000
+            output_cost = output_tokens * 0.40 / 1_000_000
             total_cost = input_cost + output_cost
 
             logger.logger.info(
@@ -265,11 +264,17 @@ CRITICAL: If you see a calendar grid with:
             self.total_cost += total_cost
             self.api_calls_count += 1
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=True
+    )
     async def extract_with_tools(self, b64_image: str, prompt: str, attempt: int) -> List[Flight]:
-        tools = [
-            {
-                "type": "function",
-                "function": {
+        # Define the tool structure for Gemini
+        extract_flights_tool = {
+            "function_declarations": [
+                {
                     "name": "extract_flights",
                     "description": "Extract all flight information from the image",
                     "parameters": {
@@ -282,10 +287,10 @@ CRITICAL: If you see a calendar grid with:
                                     "properties": {
                                         "date": {"type": "string"},
                                         "flight_no": {"type": "string"},
-                                        "origin": {"type": ["string", "null"]},
-                                        "dest": {"type": ["string", "null"]},
-                                        "sched_out_local": {"type": ["string", "null"]},
-                                        "sched_in_local": {"type": ["string", "null"]},
+                                        "origin": {"type": "string"},
+                                        "dest": {"type": "string"},
+                                        "sched_out_local": {"type": "string"},
+                                        "sched_in_local": {"type": "string"},
                                     },
                                     "required": ["date", "flight_no"],
                                 },
@@ -293,31 +298,31 @@ CRITICAL: If you see a calendar grid with:
                         },
                         "required": ["flights"],
                     },
-                },
-            }
-        ]
+                }
+            ]
+        }
 
-        messages = self._create_messages(b64_image, prompt, attempt)
-        logger.logger.info(f"OpenAI call (attempt={attempt}, model={MODEL})")
+        content = self._create_content(b64_image, prompt, attempt)
+        logger.logger.info(f"Gemini call (attempt={attempt}, model={MODEL})")
 
-        try:
-            response = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice={"type": "function", "function": {"name": "extract_flights"}},
-                    max_completion_tokens=MAX_TOKENS,
-                    n=2 if attempt > 1 else 1,
-                ),
-                timeout=OPENAI_TIMEOUT,
+        model = genai.GenerativeModel(
+            MODEL, 
+            tools=[extract_flights_tool],
+            system_instruction="You are a flight schedule extraction expert. Always return valid JSON."
+        )
+
+        # Gemini async generation
+        req_time = datetime.now().isoformat()
+        logger.logger.info(f"[REQUEST_TRACKER] Sending request to Gemini (model={MODEL}) at {req_time} | Attempt: {attempt}")
+        
+        response = await model.generate_content_async(
+            content,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.1,
+                # Force function calling if possible, or auto
+                tool_config={'function_calling_config': {'mode': 'ANY'}}
             )
-        except asyncio.TimeoutError:
-            logger.logger.error(f"OpenAI timeout after {OPENAI_TIMEOUT}s")
-            return []
-        except Exception as e:
-            logger.logger.error(f"OpenAI error: {e}")
-            return []
+        )
 
         await self._record_usage(response)
         flights = self._parse_response(response)
@@ -331,15 +336,14 @@ CRITICAL: If you see a calendar grid with:
 
         return flights
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=True
+    )
     async def extract_direct_json(self, b64_image: str, attempt: int) -> List[Flight]:
-        messages = [
-            {"role": "system", "content": "Extract flight data and return ONLY valid JSON."},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": """Extract all flights from this image.
+        content = self._create_content(b64_image, """Extract all flights from this image.
 
 Return ONLY this JSON structure:
 {
@@ -353,29 +357,23 @@ Return ONLY this JSON structure:
       "sched_in_local": "HHMM"
     }
   ]
-}""",
-                    },
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
-                ],
-            },
-        ]
+}""", attempt)
 
-        try:
-            response = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    max_completion_tokens=MAX_TOKENS,
-                    response_format={"type": "json_object"},
-                ),
-                timeout=OPENAI_TIMEOUT,
+        model = genai.GenerativeModel(
+            MODEL,
+            system_instruction="Extract flight data and return ONLY valid JSON."
+        )
+
+        req_time = datetime.now().isoformat()
+        logger.logger.info(f"[REQUEST_TRACKER] Sending request to Gemini (model={MODEL}) at {req_time} | Attempt: {attempt} | Mode: JSON")
+
+        response = await model.generate_content_async(
+            content,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.1,
+                response_mime_type="application/json"
             )
-        except asyncio.TimeoutError:
-            logger.logger.error(f"OpenAI JSON timeout after {OPENAI_TIMEOUT}s")
-            return []
-        except Exception as e:
-            logger.logger.error(f"OpenAI JSON error: {e}")
-            return []
+        )
 
         await self._record_usage(response)
         return self._parse_response(response)
@@ -442,7 +440,7 @@ Return ONLY this JSON structure:
         if not all_flights and image_versions:
             try:
                 original_model = MODEL
-                logger.logger.info("Escalating to GPT-5.1-thinking for rescue attempt")
+                logger.logger.info("Escalating to Gemini rescue attempt")
                 # You could swap model via env or config here; for now we just reuse MODEL
                 flights = await self.extract_with_tools(
                     image_versions[0][0],

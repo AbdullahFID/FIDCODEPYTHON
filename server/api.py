@@ -16,11 +16,12 @@ from starlette.status import HTTP_400_BAD_REQUEST
 import cv2
 import numpy as np
 
-from openai import AsyncOpenAI
-
+import google.generativeai as genai
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from config import MODEL, TIMEOUT, MAX_WORKERS
+from logging_utils import configure_logging, log_event, new_request_id
 from flight_intel_patch.validator import validate_extraction_results
-from pdf_processor import PDFProcessor  # 🔥 IMPORT PDF PROCESSOR
-from logging_utils import configure_logging, new_request_id, log_event
+from pdf_processor import PDFProcessor
 
 # ------------------------------------------------------------------------------
 # APP + LOGGING SETUP
@@ -31,27 +32,21 @@ logger = logging.getLogger("flightintel.api")
 
 app = FastAPI(title="Flight-Intel v8.1", version="8.1.0")
 
-# Basic CORS (adjust origins for your environment)
+# Basic CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8001", "http://127.0.0.1:8001", "http://0.0.0.0:8001"],
+    allow_origin_regex=r"http://localhost:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# OpenAI client
-client = AsyncOpenAI()
-
-MODEL_NAME = "gpt-5.1"
-OPENAI_TIMEOUT_SECONDS = 30
-WORKER_COUNT = 16
-
 logger.info(
     "Config: model=%s, timeout=%ss, workers=%s",
-    MODEL_NAME,
-    OPENAI_TIMEOUT_SECONDS,
-    WORKER_COUNT,
+    MODEL,
+    TIMEOUT,
+    MAX_WORKERS,
 )
 logger.info("Starting Flight-Intel v8.1 server")
 
@@ -195,7 +190,17 @@ def _cv2_to_bytes(cv_img: np.ndarray) -> bytes:
 # OPENAI VISION (CORRECTED + STRONG CONSTRAINTS)
 # ------------------------------------------------------------------------------
 
-async def _openai_extract_flights(
+# ------------------------------------------------------------------------------
+# GEMINI VISION
+# ------------------------------------------------------------------------------
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type(Exception),
+    reraise=True
+)
+async def _gemini_extract_flights(
     image_bytes: bytes,
     airline: Optional[str],
     page_num: int = 1,
@@ -205,9 +210,8 @@ async def _openai_extract_flights(
 
     t0 = time.time()
 
-    # Base64 encode the image
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-    image_url = f"data:image/jpeg;base64,{b64}"
+    # Create Gemini model instance
+    model = genai.GenerativeModel(MODEL)
 
     system_prompt = (
         "You are a flight schedule extraction engine.\n"
@@ -240,64 +244,47 @@ async def _openai_extract_flights(
             "If there is ambiguity, prefer flights from this airline."
         )
 
-    log_event(logger, "openai_call_started", model=MODEL_NAME, page=page_num)
+    log_event(logger, "gemini_call_started", model=MODEL, page=page_num)
 
-    try:
-        resp = await client.chat.completions.create(
-            model=MODEL_NAME,
-            max_completion_tokens=2048,
+    # Create image part
+    # Gemini accepts bytes directly for some formats, or we can use PIL
+    img = Image.open(io.BytesIO(image_bytes))
+    
+    prompt = (
+        "Extract all flights from this schedule. "
+        "Return ONLY JSON as specified. "
+        "Do NOT include flights that are missing a flight number."
+    )
+
+    # Generate content
+    # Note: genai.GenerativeModel.generate_content_async is available in newer versions
+    # or we can run in executor if async is not fully supported yet.
+    # Assuming standard google-generativeai usage.
+    
+    req_time = datetime.now().isoformat()
+    logger.info(f"[REQUEST_TRACKER] Sending request to Gemini (model={MODEL}) at {req_time} | Page: {page_num}")
+
+    response = await model.generate_content_async(
+        [system_prompt, prompt, img],
+        generation_config=genai.types.GenerationConfig(
             temperature=0,
-            timeout=OPENAI_TIMEOUT_SECONDS,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Extract all flights from this schedule. "
-                                "Return ONLY JSON as specified. "
-                                "Do NOT include flights that are missing a flight number."
-                            ),
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_url},
-                        },
-                    ],
-                },
-            ],
+            response_mime_type="application/json"
         )
-    except Exception as e:
-        log_event(logger, "openai_call_error", level=logging.ERROR, error=str(e), page=page_num)
-        raise HTTPException(status_code=500, detail=str(e))
+    )
 
     elapsed = time.time() - t0
+    text = response.text or ""
 
-    choice = resp.choices[0]
-    text = choice.message.content or ""
-
-    usage = resp.usage or {}
-    total_tokens = getattr(usage, "total_tokens", None) or 0
-    input_tokens = (
-        getattr(usage, "prompt_tokens", None)
-        or getattr(usage, "input_tokens", None)
-        or 0
-    )
-    output_tokens = (
-        getattr(usage, "completion_tokens", None)
-        or getattr(usage, "output_tokens", None)
-        or 0
-    )
+    # Usage metadata might be available in response.usage_metadata
+    usage = response.usage_metadata
+    total_tokens = usage.total_token_count if usage else 0
+    input_tokens = usage.prompt_token_count if usage else 0
+    output_tokens = usage.candidates_token_count if usage else 0
 
     log_event(
         logger,
-        "openai_call_finished",
-        model=MODEL_NAME,
+        "gemini_call_finished",
+        model=MODEL,
         page=page_num,
         duration_ms=int(elapsed * 1000),
         tokens_total=total_tokens,
@@ -308,8 +295,17 @@ async def _openai_extract_flights(
     try:
         data = json.loads(text)
     except Exception:
-        log_event(logger, "openai_parse_error", level=logging.ERROR, raw_output=text, page=page_num)
-        raise HTTPException(400, "Model did not return valid JSON")
+        # Try to clean markdown
+        try:
+            cleaned = text.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            data = json.loads(cleaned)
+        except Exception:
+            log_event(logger, "gemini_parse_error", level=logging.ERROR, raw_output=text, page=page_num)
+            raise HTTPException(400, "Model did not return valid JSON")
 
     flights = data.get("flights") or []
     connections = data.get("connections") or []
@@ -403,7 +399,7 @@ async def extract(
                 log_event(logger, "image_analysis", page=page_idx, **img_stats)
             
             # Extract flights from this page
-            extraction_raw = await _openai_extract_flights(page_bytes, airline_code, page_idx)
+            extraction_raw = await _gemini_extract_flights(page_bytes, airline_code, page_idx)
             
             page_elapsed = time.time() - page_t0
             page_times[f"page_{page_idx}_total"] = page_elapsed
@@ -446,7 +442,7 @@ async def extract(
         page_t0 = time.time()
         log_event(logger, "page_processing_started", page_number=1)
 
-        extraction_raw = await _openai_extract_flights(file_bytes, airline_code, page_num=1)
+        extraction_raw = await _gemini_extract_flights(file_bytes, airline_code, page_num=1)
 
         page_elapsed = time.time() - page_t0
 
@@ -589,9 +585,10 @@ async def extract(
             duration_ms=int((time.time() - validation_start) * 1000),
         )
 
-    # Cost estimation (GPT-5.1 pricing: $2.50/1M input, $10/1M output)
-    input_cost = (usage["input_tokens"] / 1_000_000) * 2.50
-    output_cost = (usage["output_tokens"] / 1_000_000) * 10.00
+    # Cost estimation (Gemini 2.0 Flash pricing: Free tier or low cost)
+    # Using approx $0.10/1M input, $0.40/1M output for Flash (illustrative)
+    input_cost = (usage["input_tokens"] / 1_000_000) * 0.10
+    output_cost = (usage["output_tokens"] / 1_000_000) * 0.40
     total_cost = input_cost + output_cost
 
     extraction_validated["cost_analysis"] = {

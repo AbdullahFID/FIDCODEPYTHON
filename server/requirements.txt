@@ -12,10 +12,11 @@ pydantic>=2.7.0
 # pydantic-core will be installed as a dependency of pydantic
 
 # OpenAI + LangChain - Upgraded for Python 3.13
-openai>=1.16.0
+# OpenAI + LangChain - Upgraded for Python 3.13
+google-generativeai>=0.8.3
+tenacity>=8.2.0
 langchain>=0.1.20
 langchain-core>=0.1.52
-langchain-openai>=0.1.6
 
 # OCR pipeline (Tesseract only)
 opencv-python-headless>=4.8.1.78
